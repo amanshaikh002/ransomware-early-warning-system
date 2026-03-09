@@ -22,6 +22,7 @@ watchdog  – cross-platform file-system event notification
 psutil    – process-level metadata (PID, process name)
 datetime  – ISO-8601 timestamps
 os / json – path construction and structured output
+pathlib   – robust path parsing for event filtering
 
 Author   : <your-name>
 Created  : 2026-03-09
@@ -33,6 +34,7 @@ import sys
 import time
 import json
 import logging
+from pathlib import PurePath
 from datetime import datetime, timezone
 
 from watchdog.observers import Observer
@@ -48,6 +50,84 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+# ===========================================================================
+#  Event Filtering — suppress noise from system / build / temp files
+# ===========================================================================
+
+#: Directory names whose events should be silently ignored.
+#: Any path component matching one of these (case-insensitive) triggers
+#: the filter.  Add entries here to extend coverage.
+IGNORED_DIRECTORIES: set[str] = {
+    ".git",
+    "__pycache__",
+    "venv",
+    ".venv",
+    "node_modules",
+    "AppData",
+    "ProgramData",
+    "Windows",
+    "$Recycle.Bin",
+}
+
+#: File extensions (lowercase, with leading dot) to ignore.
+IGNORED_EXTENSIONS: set[str] = {
+    ".lock",
+    ".tmp",
+    ".log",
+    ".cache",
+    ".pyo",
+    ".pyc",
+}
+
+#: Substring patterns — if any of these appear anywhere in the
+#: **filename** (not the full path), the event is filtered out.
+IGNORED_FILENAME_PATTERNS: list[str] = [
+    "~$",       # Microsoft Office temp files
+    ".temp",    # generic temp suffix
+    ".swp",     # Vim swap files
+]
+
+
+def should_ignore_event(file_path: str) -> bool:
+    """
+    Determine whether a file-system event should be silently discarded.
+
+    The check is intentionally fast — it only inspects path components
+    and the filename string without touching the filesystem.
+
+    Parameters
+    ----------
+    file_path : str
+        Absolute or relative path reported by watchdog.
+
+    Returns
+    -------
+    bool
+        ``True`` if the event should be ignored.
+    """
+    path = PurePath(file_path)
+
+    # ---- 1. Check each directory component ----
+    for part in path.parts:
+        if part in IGNORED_DIRECTORIES:
+            logger.debug("Ignored event (directory): %s", file_path)
+            return True
+
+    # ---- 2. Check file extension ----
+    if path.suffix.lower() in IGNORED_EXTENSIONS:
+        logger.debug("Ignored event (extension): %s", file_path)
+        return True
+
+    # ---- 3. Check filename substring patterns ----
+    name = path.name
+    for pattern in IGNORED_FILENAME_PATTERNS:
+        if pattern in name:
+            logger.debug("Ignored event (pattern '%s'): %s", pattern, file_path)
+            return True
+
+    return False
 
 
 # ===========================================================================
@@ -146,6 +226,10 @@ class _EventHandler(FileSystemEventHandler):
         """Process the event: log it, invoke the callback, and return it."""
         # Skip directory-level events – we only care about files
         if event.is_directory:
+            return None
+
+        # ---- Apply noise filter ----
+        if should_ignore_event(event.src_path):
             return None
 
         event_dict = self._build_event(event, event_type)
