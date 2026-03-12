@@ -105,6 +105,9 @@ class FeatureExtractor:
         # ---- persistent storage of all feature vectors ----
         self._feature_vectors: list[dict] = []
 
+        # ---- file stream for standalone modules ----
+        self.stream_file: str | None = None
+
         # ---- thread-safety ----
         self._lock = threading.Lock()
         self._running: bool = False
@@ -426,6 +429,14 @@ class FeatureExtractor:
         print("─" * 60 + "\n")
         self._feature_vectors.append(feature_vector)
 
+        # ---- Append to streaming file for Module 4 ----
+        if self.stream_file:
+            try:
+                with open(self.stream_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(feature_vector) + "\n")
+            except OSError as e:
+                logger.error("Failed to write to stream file %s: %s", self.stream_file, e)
+
 
 # ===========================================================================
 #  Simulation Mode — synthetic event generator
@@ -621,12 +632,24 @@ def _run_realtime(extractor: FeatureExtractor) -> None:
     entropy_analyzer = None
     try:
         from entropy.entropy_analyzer import EntropyAnalyzer
-        entropy_analyzer = EntropyAnalyzer(threshold=7.5)
-        logger.info("🔬  EntropyAnalyzer loaded — threshold: 7.5 bits/byte")
+        entropy_analyzer = EntropyAnalyzer(threshold=4.5)
+        logger.info("🔬  EntropyAnalyzer loaded — threshold: 4.5 bits/byte")
     except ImportError:
         logger.warning(
             "EntropyAnalyzer not found. Entropy analysis will be skipped."
         )
+
+    # Configure FeatureExtractor to write to feature_stream.jsonl 
+    # so Module 4 (DriftDetector) can read it independently.
+    stream_path = os.path.join(project_root, "feature_stream.jsonl")
+    extractor.stream_file = stream_path
+    
+    # Empty the file at start of new real-time session
+    try:
+        open(stream_path, "w").close()
+        logger.info("📝  Feature stream initialised at: %s", stream_path)
+    except OSError as e:
+        logger.warning("Could not initialise stream file: %s", e)
 
     # Build the list of directories to watch
     monitored_paths = get_default_monitored_paths()
@@ -681,13 +704,14 @@ def _run_realtime(extractor: FeatureExtractor) -> None:
     extractor.start_window_timer()
 
     print("\n" + "=" * 60)
-    print("  MODULE 2 — FEATURE EXTRACTOR  (real-time mode)")
+    print("  MODULE 2/3 — REAL-TIME MONITORING PIPELINE")
     print("-" * 60)
     print("  Monitoring directories:")
     for d in monitored_paths:
         print(f"    • {d}")
     print("-" * 60)
     print(f"  Window size : {extractor._window_seconds} s  (time-driven)")
+    print(f"  Stream file : {os.path.basename(stream_path)}")
     print("  Press Ctrl+C to stop")
     print("=" * 60 + "\n")
 
@@ -713,6 +737,110 @@ def _run_realtime(extractor: FeatureExtractor) -> None:
             print(f"\n--- Vector {i} ---")
             print(json.dumps(v, indent=2))
     print("\n✅  Session ended.\n")
+
+
+# ===========================================================================
+#  Real-Time Mode (event-stream subscriber)
+# ===========================================================================
+
+def _run_realtime_from_event_stream(extractor: FeatureExtractor) -> None:
+    """
+    Real-time mode: consume events published by Module 1 (FileWatcher)
+    via the shared JSONL event stream.
+
+    Expected runtime topology:
+
+        Terminal 1: python monitoring/file_watcher.py
+        Terminal 2: python features/feature_extractor.py --mode realtime
+
+    FileWatcher appends events to ``event_stream.jsonl`` and this
+    module tails that file, feeding each event into the extractor.
+    """
+    # Resolve the project root (features/ sits one level below it)
+    project_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..")
+    )
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    # Path to the shared event stream written by FileWatcher
+    event_stream_path = os.path.join(project_root, "event_stream.jsonl")
+    # Ensure the stream file exists so open() does not fail even if
+    # the watcher has not started yet.
+    try:
+        open(event_stream_path, "a", encoding="utf-8").close()
+    except OSError as exc:
+        logger.error("Could not access event stream file %s: %s", event_stream_path, exc)
+        sys.exit(1)
+
+    # Configure FeatureExtractor to write to feature_stream.jsonl
+    # so Module 4 (DriftDetector) can read it independently.
+    feature_stream_path = os.path.join(project_root, "feature_stream.jsonl")
+    extractor.stream_file = feature_stream_path
+
+    # Empty the feature stream at the start of a new real-time session
+    try:
+        open(feature_stream_path, "w", encoding="utf-8").close()
+        logger.info("📝  Feature stream initialised at: %s", feature_stream_path)
+    except OSError as exc:
+        logger.warning("Could not initialise feature stream file: %s", exc)
+
+    # Start the time-driven window timer
+    extractor.start_window_timer()
+
+    print("\n" + "=" * 60)
+    print("  MODULE 2 — FEATURE EXTRACTOR  (real-time mode)")
+    print("-" * 60)
+    print("  Event source : event_stream.jsonl")
+    print(f"  Window size  : {extractor._window_seconds} s  (time-driven)")
+    print(f"  Output file  : {os.path.basename(feature_stream_path)}")
+    print("  Press Ctrl+C to stop")
+    print("=" * 60 + "\n")
+
+    buffer = ""
+    try:
+        with open(event_stream_path, "r", encoding="utf-8") as f:
+            # Go to the end of the file; we only care about new live events.
+            f.seek(0, 2)
+            while True:
+                chunk = f.readline()
+                if not chunk:
+                    time.sleep(1)
+                    continue
+
+                buffer += chunk
+                if not buffer.endswith("\n"):
+                    # Incomplete line, wait for the rest.
+                    continue
+
+                line = buffer.strip()
+                buffer = ""
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.error("Failed to parse event line: %s", line)
+                    continue
+
+                extractor.add_event(event)
+    except KeyboardInterrupt:
+        print("\n⏹  Interrupt received. Shutting down …")
+        extractor.stop_window_timer()
+        fv = extractor.process_window()
+        if fv:
+            print("📊 Final partial window flushed.")
+    finally:
+        vectors = extractor.get_feature_vectors()
+        if vectors:
+            print("\n" + "=" * 60)
+            print(f"  SESSION SUMMARY — {len(vectors)} feature vector(s)")
+            print("=" * 60)
+            for i, v in enumerate(vectors, 1):
+                print(f"\n--- Vector {i} ---")
+                print(json.dumps(v, indent=2))
+        print("\n✅  Session ended.\n")
 
 
 # ===========================================================================
@@ -757,7 +885,7 @@ def main() -> None:
     if args.mode == "simulation":
         _run_simulation(extractor)
     else:
-        _run_realtime(extractor)
+        _run_realtime_from_event_stream(extractor)
 
 
 if __name__ == "__main__":
