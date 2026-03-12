@@ -129,6 +129,34 @@ These features represent the **behavior of the system during a time window** and
 
 ---
 
+### Module 3: Entropy Analysis
+
+This module calculates the Shannon entropy of file contents during modification or creation events to detect potential encryption.
+
+* Reads files in safe chunks
+* Calculates byte frequency probabilities
+* Flags files crossing a configurable high-entropy threshold (e.g., > 7.5 bits/byte)
+
+Example output:
+
+```json
+{
+  "file_path": "C:\\Users\\Lenovo\\Downloads\\file.docx.locked",
+  "file_size": 18721,
+  "entropy": 7.95,
+  "entropy_flag": true,
+  "threshold": 7.5
+}
+```
+
+---
+
+### Testing Simulator
+
+A safe, sandboxed testing module built into the system to generate simulated file system activity (normal, bulk, and ransomware-like) directly inside monitored directories (`~/Documents/ransomware_test/`). This guarantees the entire event pipeline (FileWatcher → FeatureExtractor → EntropyAnalyzer) can be thoroughly evaluated end-to-end without risking actual system data.
+
+---
+
 ## Algorithms Used
 
 The project integrates multiple cybersecurity and machine learning techniques:
@@ -194,6 +222,12 @@ monitoring/
 features/
     feature_extractor.py
 
+entropy/
+    entropy_analyzer.py
+
+testing/
+    ransomware_simulator.py
+
 blockchain/
 database/
 dashboard/
@@ -246,10 +280,11 @@ Completed:
 
 * File Monitoring Module
 * Feature Extraction Module
+* Entropy Analysis Engine
+* Testing Simulator
 
 Upcoming modules:
 
-* Entropy Analysis Engine
 * Behavioral Drift Detection
 * Isolation Forest Anomaly Detection
 * Risk Scoring Engine
