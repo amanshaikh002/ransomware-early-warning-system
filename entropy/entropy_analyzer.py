@@ -108,6 +108,11 @@ class EntropyAnalyzer:
         # Internal log of all analysis results
         self._results: list[dict] = []
 
+        # Optional alerts stream file; when set, high-entropy alerts
+        # (and notable errors) are appended as JSONL records so that
+        # other modules can consume them asynchronously.
+        self.alerts_file: str | None = None
+
         logger.info(
             "EntropyAnalyzer initialised — threshold: %.2f, "
             "chunk_size: %d bytes",
@@ -196,6 +201,15 @@ class EntropyAnalyzer:
         timestamp = datetime.now(timezone.utc).isoformat()
 
         try:
+            # If the original path no longer exists (common in fast
+            # ransomware simulations where files are rapidly renamed to
+            # ``.locked``), transparently fall back to analysing the
+            # corresponding ``.locked`` file when present.
+            if not os.path.isfile(file_path):
+                locked_candidate = file_path + ".locked"
+                if os.path.isfile(locked_candidate):
+                    file_path = locked_candidate
+
             entropy = self.compute_entropy(file_path)
             file_size = os.path.getsize(file_path)
             flagged = entropy > self._threshold
@@ -275,6 +289,66 @@ class EntropyAnalyzer:
 
     # -----------------------------------------------------------------
 
+    def handle_event(self, event: dict) -> dict | None:
+        """
+        Entry point for FileWatcher-style event dictionaries.
+
+        Reacts only to ``modified`` and ``renamed`` events. For
+        renames the destination path (``dest_path``) is preferred as
+        this typically carries the encrypted ``.locked`` filename.
+
+        When an entropy computation is performed the module optionally
+        writes a compact alert record to ``entropy_alerts.jsonl``.
+        """
+        event_type = event.get("event_type", "")
+        if event_type not in ("modified", "renamed"):
+            return None
+
+        if event_type == "renamed":
+            file_path = event.get("dest_path") or event.get("file_path", "")
+        else:
+            file_path = event.get("file_path", "")
+
+        if not file_path:
+            return None
+
+        result = self.analyze_file(file_path)
+
+        alert_record = {
+            "timestamp": result.get("timestamp", datetime.now(timezone.utc).isoformat()),
+            "file_path": result.get("file_path", file_path),
+            "entropy": result.get("entropy"),
+            "alert": "HIGH_ENTROPY" if result.get("entropy_flag") else "NORMAL",
+        }
+        if result.get("error"):
+            alert_record["error"] = result["error"]
+
+        if self.alerts_file:
+            try:
+                with open(self.alerts_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(alert_record) + "\n")
+            except OSError as exc:
+                logger.error("Failed to write entropy alert to %s: %s", self.alerts_file, exc)
+
+        # Optional console output so that alerts are visible in realtime.
+        # To avoid excessive noise, we print a banner only for high-entropy
+        # files and keep normal-entropy events silent.
+        if result.get("entropy_flag") and result.get("entropy") is not None:
+            print()
+            print("─" * 60)
+            label = "ENCRYPTED" if str(result["file_path"]).lower().endswith(".locked") else "FILE"
+            print(f"  {label}: {os.path.basename(result['file_path'])}")
+            print(f"  Path      : {result['file_path']}")
+            print(f"  Entropy   : {result['entropy']} bits/byte")
+            print(f"  Threshold : {self._threshold} bits/byte")
+            print("─" * 60)
+            print("\033[91m" + "  ⚠ HIGH ENTROPY DETECTED — possible encryption" + "\033[0m")
+            print("─" * 60)
+
+        return result
+
+    # -----------------------------------------------------------------
+
     def get_results(self) -> list[dict]:
         """Return all analysis results collected so far (copies)."""
         return list(self._results)
@@ -285,7 +359,7 @@ class EntropyAnalyzer:
 
 
 # ===========================================================================
-#  Real-Time Monitoring (standalone mode)
+#  Real-Time Monitoring (event-stream subscriber)
 # ===========================================================================
 
 # Folder names under the user home directory to monitor (same targets as
@@ -428,60 +502,82 @@ class _EntropyEventHandler:
 
 def _run_realtime_entropy(analyzer: "EntropyAnalyzer") -> None:
     """
-    Start a standalone watchdog observer and run entropy analysis on
-    every created/modified file in the standard user-data folders.
+    Subscribe to the central FileWatcher event stream and run entropy
+    analysis on every relevant file event.
+
+    Expected runtime topology:
+
+        Terminal 1: python monitoring/file_watcher.py
+        Terminal 3: python entropy/entropy_analyzer.py --mode realtime
+
+    FileWatcher appends events to ``event_stream.jsonl`` and this
+    module tails that file, writing alerts to ``entropy_alerts.jsonl``.
     """
+    # Resolve project root (entropy/ sits one level below it)
+    project_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..")
+    )
+
+    event_stream_path = os.path.join(project_root, "event_stream.jsonl")
+    alerts_path = os.path.join(project_root, "entropy_alerts.jsonl")
+
+    # Ensure the event stream exists so open() does not fail even if
+    # the watcher has not started yet.
     try:
-        from watchdog.observers import Observer
-        from watchdog.events import FileSystemEventHandler
-    except ImportError:
-        logger.error(
-            "watchdog is not installed.  Run: pip install watchdog"
-        )
+        open(event_stream_path, "a", encoding="utf-8").close()
+    except OSError as exc:
+        logger.error("Could not access event stream file %s: %s", event_stream_path, exc)
         import sys
         sys.exit(1)
 
-    monitored_paths = _get_monitored_paths()
-    if not monitored_paths:
-        logger.error("No valid directories to monitor. Exiting.")
-        import sys
-        sys.exit(1)
+    # Truncate / initialise the alerts file for the new session
+    try:
+        open(alerts_path, "w", encoding="utf-8").close()
+        logger.info("🧾  Entropy alerts stream initialised at: %s", alerts_path)
+    except OSError as exc:
+        logger.warning("Could not initialise entropy alerts file: %s", exc)
 
-    # Wrap our handler so watchdog recognises it
-    class _WatchdogAdapter(FileSystemEventHandler):
-        def __init__(self, inner):
-            super().__init__()
-            self._inner = inner
-        def on_any_event(self, event):
-            self._inner.dispatch(event)
-
-    handler = _WatchdogAdapter(_EntropyEventHandler(analyzer))
-    observer = Observer()
-    for path in monitored_paths:
-        observer.schedule(handler, path, recursive=True)
-        logger.info("🔍  Watching: %s", path)
-
-    observer.start()
+    analyzer.alerts_file = alerts_path
 
     print("\n" + "=" * 60)
-    print("  ENTROPY MONITOR STARTED")
+    print("  ENTROPY MONITOR STARTED (event-stream mode)")
     print("-" * 60)
-    print("  Watching directories:")
-    for p in monitored_paths:
-        print(f"    • {p}")
-    print("-" * 60)
-    print(f"  Entropy threshold : {analyzer._threshold} bits/byte")
+    print("  Event source   : event_stream.jsonl")
+    print(f"  Alerts output  : {os.path.basename(alerts_path)}")
+    print(f"  Entropy thresh.: {analyzer._threshold} bits/byte")
     print("  Press Ctrl+C to stop")
     print("=" * 60 + "\n")
 
+    buffer = ""
     try:
-        while True:
-            time.sleep(1)
+        with open(event_stream_path, "r", encoding="utf-8") as f:
+            # Tail new events only
+            f.seek(0, 2)
+            while True:
+                chunk = f.readline()
+                if not chunk:
+                    time.sleep(1)
+                    continue
+
+                buffer += chunk
+                if not buffer.endswith("\n"):
+                    continue
+
+                line = buffer.strip()
+                buffer = ""
+                if not line:
+                    continue
+
+                try:
+                    event = json.loads(line)
+                except json.JSONDecodeError:
+                    logger.error("Failed to parse event line: %s", line)
+                    continue
+
+                analyzer.handle_event(event)
     except KeyboardInterrupt:
         print("\n⏹  Interrupt received. Stopping entropy monitor …")
     finally:
-        observer.stop()
-        observer.join()
         logger.info("🛑  Entropy monitor stopped.")
 
 
