@@ -49,6 +49,7 @@ import json
 import time
 import logging
 import argparse
+import threading
 import statistics
 from collections import Counter, defaultdict
 from datetime import datetime, timezone, timedelta
@@ -104,6 +105,11 @@ class FeatureExtractor:
         # ---- persistent storage of all feature vectors ----
         self._feature_vectors: list[dict] = []
 
+        # ---- thread-safety ----
+        self._lock = threading.Lock()
+        self._running: bool = False
+        self._timer_thread: threading.Thread | None = None
+
         logger.info(
             "FeatureExtractor initialised — window size: %d s",
             self._window_seconds,
@@ -117,9 +123,7 @@ class FeatureExtractor:
         """
         Ingest a single event dictionary from the FileWatcher.
 
-        If the current window has expired the buffered events are
-        aggregated into a feature vector via :meth:`process_window`,
-        the vector is printed and stored, and the window is reset.
+        Thread-safe: acquires the internal lock before modifying window state.
 
         Parameters
         ----------
@@ -133,34 +137,19 @@ class FeatureExtractor:
             The computed feature vector if the window just closed,
             otherwise ``None``.
         """
-        event_time = self._parse_timestamp(event["timestamp"])
+        with self._lock:
+            event_time = self._parse_timestamp(event["timestamp"])
 
-        # Open the window on the very first event
-        if self._window_start is None:
-            self._window_start = event_time
-            logger.info(
-                "⏱  Window opened at %s", self._window_start.isoformat()
-            )
+            # Open the window on the very first event
+            if self._window_start is None:
+                self._window_start = event_time
+                logger.info(
+                    "⏱  Window opened at %s", self._window_start.isoformat()
+                )
 
-        # Check if the current window has expired
-        window_end = self._window_start + timedelta(
-            seconds=self._window_seconds
-        )
-        feature_vector = None
-
-        if event_time >= window_end:
-            # ---- window expired → compute + emit + reset ----
-            feature_vector = self.process_window()
-            self.reset_window()
-            # Start new window at this event's timestamp
-            self._window_start = event_time
-            logger.info(
-                "⏱  New window opened at %s", self._window_start.isoformat()
-            )
-
-        # Buffer the event in the current window
-        self._events.append(event)
-        return feature_vector
+            # Buffer the event in the current window
+            self._events.append(event)
+            return None  # Timer thread handles window expiry
 
     # -----------------------------------------------------------------
 
@@ -168,24 +157,48 @@ class FeatureExtractor:
         """
         Compute a feature vector from all events in the current window.
 
-        The vector is printed to console as formatted JSON and stored
-        in the internal list of vectors.
+        If no events were buffered an empty zero-activity vector is emitted
+        so that callers always receive a regular heartbeat output.
 
         Returns
         -------
-        dict or None
-            The feature vector, or ``None`` if no events are buffered.
+        dict
+            The feature vector (never ``None`` when a window is open).
         """
-        if not self._events or self._window_start is None:
-            logger.warning("process_window called with no buffered events.")
+        with self._lock:
+            return self._process_window_locked()
+
+    def _process_window_locked(self) -> dict | None:
+        """Internal: call only while holding self._lock."""
+        if self._window_start is None:
             return None
 
         window_end = self._window_start + timedelta(
             seconds=self._window_seconds
         )
-        feature_vector = self._compute_features(
-            self._window_start, window_end
-        )
+
+        if self._events:
+            feature_vector = self._compute_features(self._window_start, window_end)
+        else:
+            # Emit a zero-activity vector — window was quiet
+            feature_vector = {
+                "window_start":              self._window_start.isoformat(),
+                "window_end":                window_end.isoformat(),
+                "files_created":             0,
+                "files_modified":            0,
+                "files_deleted":             0,
+                "rename_count":              0,
+                "total_file_events":         0,
+                "write_rate":                0.0,
+                "unique_file_types":         0,
+                "directories_touched":       0,
+                "unique_process_count":      0,
+                "files_touched_per_process": 0.0,
+                "average_file_size":         0.0,
+                "max_file_size":             0,
+                "min_file_size":             0,
+            }
+
         self._emit(feature_vector)
         return feature_vector
 
@@ -194,9 +207,13 @@ class FeatureExtractor:
     def reset_window(self) -> None:
         """
         Discard buffered events and reset the window start marker.
-
-        Call this after :meth:`process_window` to begin a fresh window.
+        Thread-safe: call from outside the timer thread.
         """
+        with self._lock:
+            self._reset_window_locked()
+
+    def _reset_window_locked(self) -> None:
+        """Internal: call only while holding self._lock."""
         self._events.clear()
         self._window_start = None
         logger.info("🔄  Window reset — ready for new events.")
@@ -205,11 +222,78 @@ class FeatureExtractor:
 
     def get_feature_vectors(self) -> list[dict]:
         """Return all feature vectors computed so far (copies)."""
-        return list(self._feature_vectors)
+        with self._lock:
+            return list(self._feature_vectors)
 
     def clear_feature_vectors(self) -> None:
         """Clear the stored feature vectors."""
-        self._feature_vectors.clear()
+        with self._lock:
+            self._feature_vectors.clear()
+
+    # =================================================================
+    #  Time-driven window timer (background thread)
+    # =================================================================
+
+    def start_window_timer(self) -> None:
+        """
+        Start a background thread that automatically closes each window
+        after ``window_seconds`` regardless of file-system activity.
+
+        This ensures feature vectors are emitted on a fixed schedule
+        even during quiet periods with no file events.
+        """
+        if self._running:
+            return
+        self._running = True
+        # Initialise the window start to now so the first tick is on time
+        with self._lock:
+            if self._window_start is None:
+                self._window_start = datetime.now(timezone.utc)
+                logger.info(
+                    "⏱  Window opened at %s", self._window_start.isoformat()
+                )
+        self._timer_thread = threading.Thread(
+            target=self._timer_loop,
+            name="FeatureExtractorTimer",
+            daemon=True,
+        )
+        self._timer_thread.start()
+        logger.info("⏲  Time-driven window timer started (%d s).", self._window_seconds)
+
+    def stop_window_timer(self) -> None:
+        """Signal the timer thread to stop and wait for it to exit."""
+        self._running = False
+        if self._timer_thread and self._timer_thread.is_alive():
+            self._timer_thread.join(timeout=5)
+        logger.info("⏹  Window timer stopped.")
+
+    def _timer_loop(self) -> None:
+        """
+        Background loop: wakes every second and checks whether the current
+        sliding window has expired.  If so, it processes and resets the
+        window, then opens a fresh one anchored to the current time.
+        """
+        while self._running:
+            time.sleep(1)
+            with self._lock:
+                if not self._running:
+                    break
+                if self._window_start is None:
+                    continue
+                now = datetime.now(timezone.utc)
+                window_end = self._window_start + timedelta(
+                    seconds=self._window_seconds
+                )
+                if now >= window_end:
+                    # ---- Time's up: emit feature vector ----
+                    self._process_window_locked()
+                    # Reset and open new window anchored to wall-clock time
+                    self._events.clear()
+                    self._window_start = now
+                    logger.info(
+                        "⏱  New window opened at %s",
+                        self._window_start.isoformat(),
+                    )
 
     # =================================================================
     #  Feature computation (private)
@@ -509,19 +593,21 @@ def _run_simulation(extractor: FeatureExtractor) -> None:
 def _run_realtime(extractor: FeatureExtractor) -> None:
     """
     Start the FileWatcher from Module 1 and pipe every event into the
-    FeatureExtractor.  The extractor's sliding window handles automatic
-    aggregation and feature-vector emission.
-    """
-    # Import FileWatcher here to avoid hard dependency if only using
-    # simulation mode or testing the extractor in isolation.
-    try:
-        # Resolve the project root (features/ sits one level below it)
-        project_root = os.path.abspath(
-            os.path.join(os.path.dirname(__file__), "..")
-        )
-        if project_root not in sys.path:
-            sys.path.insert(0, project_root)
+    FeatureExtractor *and* the EntropyAnalyzer.
 
+    For every ``created`` or ``modified`` event the entropy of the file
+    is calculated immediately.  If the entropy crosses the threshold a
+    HIGH ENTROPY DETECTED alert is printed to the console.
+    """
+    # Resolve the project root (features/ sits one level below it)
+    project_root = os.path.abspath(
+        os.path.join(os.path.dirname(__file__), "..")
+    )
+    if project_root not in sys.path:
+        sys.path.insert(0, project_root)
+
+    # ---- Import FileWatcher (Module 1) ----
+    try:
         from monitoring.file_watcher import FileWatcher, get_default_monitored_paths
     except ImportError as exc:
         logger.error(
@@ -530,6 +616,17 @@ def _run_realtime(extractor: FeatureExtractor) -> None:
             exc,
         )
         sys.exit(1)
+
+    # ---- Import EntropyAnalyzer (Module 3) ----
+    entropy_analyzer = None
+    try:
+        from entropy.entropy_analyzer import EntropyAnalyzer
+        entropy_analyzer = EntropyAnalyzer(threshold=7.5)
+        logger.info("🔬  EntropyAnalyzer loaded — threshold: 7.5 bits/byte")
+    except ImportError:
+        logger.warning(
+            "EntropyAnalyzer not found. Entropy analysis will be skipped."
+        )
 
     # Build the list of directories to watch
     monitored_paths = get_default_monitored_paths()
@@ -544,19 +641,44 @@ def _run_realtime(extractor: FeatureExtractor) -> None:
     )
 
     # Override the internal event handler callback so every event is
-    # also fed into the FeatureExtractor.
+    # also fed into the FeatureExtractor and the EntropyAnalyzer.
     original_callback = watcher._handler._event_callback
 
     def _combined_callback(event_dict: dict) -> None:
-        """Forward events to both the watcher buffer and the extractor."""
+        """Forward events to the watcher buffer, the extractor, and entropy."""
         if original_callback:
             original_callback(event_dict)
+
+        # ---- Feature extraction ----
         extractor.add_event(event_dict)
+
+        # ---- Entropy analysis (created / modified only) ----
+        if entropy_analyzer and event_dict.get("event_type") in ("created", "modified"):
+            file_path = event_dict.get("file_path", "")
+            if file_path and os.path.isfile(file_path):
+                entropy_result = entropy_analyzer.analyze_file(file_path)
+                # Always print the entropy analysis result
+                print()
+                print("\033[96m" + "─" * 60 + "\033[0m")
+                print("\033[96m" + "🔬 ENTROPY ANALYSIS" + "\033[0m")
+                print("\033[96m" + "─" * 60 + "\033[0m")
+                print(json.dumps(entropy_result, indent=2))
+                # Print high-entropy warning if flagged
+                if entropy_result.get("entropy_flag"):
+                    print()
+                    print("\033[91m" + "=" * 60 + "\033[0m")
+                    print("\033[91m" + "  ⚠️  HIGH ENTROPY DETECTED" + "\033[0m")
+                    print("\033[91m" + f"  Possible ransomware encryption detected!" + "\033[0m")
+                    print("\033[91m" + f"  File    : {os.path.basename(file_path)}" + "\033[0m")
+                    print("\033[91m" + f"  Entropy : {entropy_result.get('entropy')} bits/byte" + "\033[0m")
+                    print("\033[91m" + "=" * 60 + "\033[0m")
+                print()
 
     watcher._handler._event_callback = _combined_callback
 
-    # Start monitoring
+    # Start monitoring + time-driven window timer
     watcher.start()
+    extractor.start_window_timer()
 
     print("\n" + "=" * 60)
     print("  MODULE 2 — FEATURE EXTRACTOR  (real-time mode)")
@@ -565,7 +687,7 @@ def _run_realtime(extractor: FeatureExtractor) -> None:
     for d in monitored_paths:
         print(f"    • {d}")
     print("-" * 60)
-    print(f"  Window size : {extractor._window_seconds} s")
+    print(f"  Window size : {extractor._window_seconds} s  (time-driven)")
     print("  Press Ctrl+C to stop")
     print("=" * 60 + "\n")
 
@@ -574,12 +696,10 @@ def _run_realtime(extractor: FeatureExtractor) -> None:
             time.sleep(1)
     except KeyboardInterrupt:
         print("\n⏹  Interrupt received. Shutting down …")
-
-        # Flush any remaining events in the current window
+        extractor.stop_window_timer()
         fv = extractor.process_window()
         if fv:
             print("📊 Final partial window flushed.")
-        extractor.reset_window()
     finally:
         watcher.stop()
 
