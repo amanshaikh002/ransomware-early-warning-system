@@ -34,6 +34,7 @@ import sys
 import time
 import json
 import logging
+import threading
 from pathlib import PurePath
 from datetime import datetime, timezone
 
@@ -88,6 +89,15 @@ IGNORED_FILENAME_PATTERNS: list[str] = [
     ".temp",    # generic temp suffix
     ".swp",     # Vim swap files
 ]
+
+#: Filenames for internal JSONL streams that must be ignored to prevent
+#: recursive self-logging when the watcher and downstream modules share
+#: the same directory tree.
+IGNORE_FILES: set[str] = {
+    "event_stream.jsonl",
+    "feature_stream.jsonl",
+    "entropy_alerts.jsonl",
+}
 
 
 def should_ignore_event(file_path: str) -> bool:
@@ -228,6 +238,13 @@ class _EventHandler(FileSystemEventHandler):
         if event.is_directory:
             return None
 
+        # ---- Ignore internal stream files (prevent recursive logging) ----
+        src_path = getattr(event, "src_path", "") or ""
+        dest_path = getattr(event, "dest_path", "") or ""
+        for name in IGNORE_FILES:
+            if name in src_path or (dest_path and name in dest_path):
+                return None
+
         # ---- Apply noise filter ----
         if should_ignore_event(event.src_path):
             return None
@@ -267,7 +284,7 @@ class _EventHandler(FileSystemEventHandler):
 
 
 # ===========================================================================
-#  FileWatcher – public API
+    #  FileWatcher – public API
 # ===========================================================================
 class FileWatcher:
     """
@@ -294,6 +311,7 @@ class FileWatcher:
         self,
         watch_directories: list[str],
         recursive: bool = True,
+        stream_file: str | None = None,
     ):
         """
         Parameters
@@ -308,17 +326,63 @@ class FileWatcher:
             os.path.abspath(d) for d in watch_directories
         ]
         self._recursive = recursive
+
+        # Thread-safe state
+        self._lock = threading.Lock()
         self._events: list[dict] = []          # in-memory event buffer
+        self._callbacks: list[callable] = []   # subscriber callbacks
+
+        # Optional JSONL stream file for cross-process consumers
+        self._stream_file: str | None = stream_file
+        if self._stream_file:
+            try:
+                # Start a fresh stream each time the watcher is launched
+                open(self._stream_file, "w", encoding="utf-8").close()
+                logger.info("📝  Event stream initialised at: %s", self._stream_file)
+            except OSError as exc:
+                logger.warning("Could not initialise event stream file %s: %s", self._stream_file, exc)
+                self._stream_file = None
+
         self._handler = _EventHandler(
-            event_callback=self._store_event,
+            event_callback=self._handle_event,
         )
         self._observer = Observer()
 
     # ----- internal -------------------------------------------------------
 
-    def _store_event(self, event_dict: dict) -> None:
-        """Callback that appends each event to the internal buffer."""
-        self._events.append(event_dict)
+    def _handle_event(self, event_dict: dict | None) -> None:
+        """
+        Central event sink called by the internal handler.
+
+        Responsibilities:
+        - Append event to in-memory buffer
+        - Fan out to registered callbacks (subscribers)
+        - Append to JSONL stream file (if configured)
+        """
+        if not event_dict:
+            return
+
+        # Snapshot callbacks under lock so subscribers can mutate
+        # their own state without blocking the watcher thread.
+        with self._lock:
+            self._events.append(event_dict)
+            callbacks = list(self._callbacks)
+            stream_file = self._stream_file
+
+        # ---- Fan-out to in-process subscribers ----
+        for cb in callbacks:
+            try:
+                cb(event_dict)
+            except Exception as exc:  # noqa: BLE001
+                logger.exception("Error in event callback %r: %s", cb, exc)
+
+        # ---- Append to JSONL stream for out-of-process consumers ----
+        if stream_file:
+            try:
+                with open(stream_file, "a", encoding="utf-8") as f:
+                    f.write(json.dumps(event_dict) + "\n")
+            except OSError as exc:
+                logger.error("Failed to write event to %s: %s", stream_file, exc)
 
     # ----- public API -----------------------------------------------------
 
@@ -360,6 +424,20 @@ class FileWatcher:
         self._observer.join()
         logger.info("🛑  FileWatcher stopped.")
 
+    def add_event_callback(self, callback) -> None:
+        """
+        Register a callback to receive every filesystem event dictionary.
+
+        The callback should accept a single ``event: dict`` argument.
+        """
+        with self._lock:
+            self._callbacks.append(callback)
+
+    def remove_event_callback(self, callback) -> None:
+        """Unregister a previously registered event callback."""
+        with self._lock:
+            self._callbacks = [cb for cb in self._callbacks if cb is not callback]
+
     def run(self) -> None:
         """
         Convenience method: start monitoring and block until the user
@@ -395,54 +473,39 @@ class FileWatcher:
         list[dict]
             A list of event dictionaries captured since the watcher started.
         """
-        return list(self._events)
+        with self._lock:
+            return list(self._events)
 
     def clear_events(self) -> None:
         """Clear the internal event buffer."""
-        self._events.clear()
+        with self._lock:
+            self._events.clear()
 
 
 # ===========================================================================
 #  Default monitored paths — common ransomware targets
 # ===========================================================================
 
-#: Folder names under the user home directory that ransomware commonly targets.
-DEFAULT_TARGET_FOLDERS: list[str] = [
-    "Desktop",
-    "Documents",
-    "Downloads",
-    "Pictures",
-]
+#: Dedicated sandbox directory used by the ransomware simulator.
+#: All monitored activity is confined to this path so internal project
+#: files (including JSONL streams) are not observed.
+WATCH_DIRECTORY: str = r"C:\Users\Lenovo\Documents\ransomware_test"
 
 
 def get_default_monitored_paths() -> list[str]:
     """
-    Build a list of absolute paths to common user-data directories.
+    Return the default directory to monitor.
 
-    Uses ``os.path.expanduser("~")`` to detect the current Windows
-    user's home directory and appends each folder from
-    :data:`DEFAULT_TARGET_FOLDERS`.
+    For this project we restrict monitoring to the ransomware simulator
+    sandbox directory so that project files (including the event and
+    feature streams) are never observed.
 
     Returns
     -------
     list[str]
-        Absolute paths that exist on disk.  Non-existent paths are
-        silently skipped so the watcher does not crash if a folder has
-        been removed or relocated.
+        A single-item list containing :data:`WATCH_DIRECTORY`.
     """
-    home = os.path.expanduser("~")
-    monitored_paths: list[str] = []
-
-    for folder in DEFAULT_TARGET_FOLDERS:
-        full_path = os.path.join(home, folder)
-        if os.path.isdir(full_path):
-            monitored_paths.append(full_path)
-        else:
-            logger.warning(
-                "⚠  Skipping non-existent directory: %s", full_path
-            )
-
-    return monitored_paths
+    return [WATCH_DIRECTORY]
 
 
 # ===========================================================================
@@ -460,5 +523,11 @@ if __name__ == "__main__":
         logger.error("No valid directories to monitor. Exiting.")
         sys.exit(1)
 
-    watcher = FileWatcher(monitored_paths)
+    # In standalone CLI mode we also enable the JSONL event stream so that
+    # other agents (FeatureExtractor, EntropyAnalyzer) can subscribe via
+    # ``event_stream.jsonl`` without a direct in-process callback.
+    project_root = os.path.abspath(os.path.join(os.path.dirname(__file__), ".."))
+    event_stream_path = os.path.join(project_root, "event_stream.jsonl")
+
+    watcher = FileWatcher(monitored_paths, stream_file=event_stream_path)
     watcher.run()
