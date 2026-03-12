@@ -76,6 +76,15 @@ Implementation Mechanics:
 - Orchestration: Writes every completed feature vector as a line of JSON into an
   append-only stream file: `feature_stream.jsonl` in the project root.
 
+Mathematical Formulas:
+- Write Rate: R = total_events / window_duration
+- Average File Size: μ_size = Σ(file_sizes) / total_files
+- File Size Variance: σ²_size = (1/n) * Σ(file_sizeᵢ - μ_size)²
+- Unique Process Ratio: UPR = unique_processes / total_events
+- Directory Diversity Index: DDI = unique_directories / total_events
+- Extension Entropy: H_ext = -Σ p(ext) · log₂(p(ext))
+  where p(ext) = frequency(ext) / total_files
+
 Integration:
 Module 2 instantiates Module 1 directly, wiring its internal `add_event` method
 as a callback to the FileWatcher.
@@ -98,6 +107,15 @@ Implementation Mechanics:
   survive rapid rename/delete sequences typical of ransomware (e.g., where a file
   is encrypted, renamed to `.locked`, and the original is deleted before the
   entropy analyzer can open it).
+
+Mathematical Formulas:
+- Shannon Entropy: H(X) = -Σ p(x) · log₂(p(x))
+  where p(x) is the probability of each byte value (0-255)
+- Byte Probability: p(x) = count(x) / total_bytes
+- Entropy Range: 0 ≤ H ≤ 8 bits per byte
+  * Plain text: ~3.0-5.0 bits
+  * Compressed: ~7.0-7.8 bits  
+  * Encrypted: ~7.9-8.0 bits
 
 Integration:
 Module 2 optionally instantiates Module 3. If present, every `modified` and
@@ -122,15 +140,36 @@ Detection Algorithms:
    Calculates `mean` and `stdev`. If the incoming feature deviates by `|Z| > 3`,
    an alert is generated. Ideal for massive, sudden ransomware bursts.
 
+   Mathematical Formulas:
+   - Z-Score: Z = (x - μ) / σ
+     where x = current value, μ = rolling mean, σ = rolling std deviation
+   - Rolling Mean: μ = (1/n) * Σ(xᵢ)
+   - Rolling Std Dev: σ = √[(1/n) * Σ(xᵢ - μ)²]
+   - Detection Threshold: |Z| > 3.0
+
 2. ADWIN (Adaptive Windowing):
    Uses the `river` library's `ADWIN` class. A sophisticated streaming algorithm
    that automatically adjusts its internal history window and detects conceptual
    distribution shifts without assuming normal data distributions.
 
+   Mathematical Formulas:
+   - H₀ (Null Hypothesis): Two windows have same expected value
+   - Test Statistic: |μ₁ - μ₂| > ε
+     where ε = √[(1/n₁ + 1/n₂) * ln(2/δ)]
+   - Confidence Bound: δ = confidence parameter (typically 0.002)
+   - Window Split: When H₀ is rejected, older window is dropped
+
 3. Page-Hinkley (Cumulative Sum Test):
    A custom-built CUSUM implementation. Tracks the cumulative running sum of minute
    deviations above the historical minimum. If the accumulated error exceeds a
    threshold (e.g., 50.0), it trips. Ideal for "low and slow" ransomware evasions.
+
+   Mathematical Formulas:
+   - Cumulative Sum: Sₙ = Σ(xᵢ - δ - μ̄)
+     where δ = minimum acceptable magnitude, μ̄ = running average
+   - Minimum Cumulative Sum: mₙ = min(S₁, S₂, ..., Sₙ)
+   - Page-Hinkley Statistic: PHₙ = Sₙ - mₙ
+   - Detection Threshold: PHₙ > λ (typically λ = 50.0)
 
 Severity Scoring:
 - 1 detector triggered  => LOW severity
