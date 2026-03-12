@@ -6,6 +6,7 @@ Implementation Details & Architecture Guide
 This document outlines the detailed implementation, architecture, and orchestration
 of all modules within the Ransomware Early-Warning System.
 
+CURRENT STATUS: Core detection pipeline fully implemented and operational.
 ================================================================================
 1. SYSTEM ARCHITECTURE OVERVIEW
 ================================================================================
@@ -13,12 +14,13 @@ The system is designed as a modular, real-time pipeline that monitors filesystem
 behavior, extracts statistical features, analyzes file entropy for encryption
 signatures, and detects anomalous behavioral drift.
 
-The pipeline consists of four independent modules that operate concurrently:
+The pipeline consists of four fully implemented modules that operate concurrently:
 
-    Module 1: File Monitoring (`monitoring/file_watcher.py`)
-    Module 2: Feature Extraction (`features/feature_extractor.py`)
-    Module 3: Entropy Analyzer (`entropy/entropy_analyzer.py`)
-    Module 4: Behavioral Drift Detector (`drift/drift_detector.py`)
+    Module 1: File Monitoring (`monitoring/file_watcher.py`) ✅ COMPLETE
+    Module 2: Feature Extraction (`features/feature_extractor.py`) ✅ COMPLETE  
+    Module 3: Entropy Analyzer (`entropy/entropy_analyzer.py`) ✅ COMPLETE
+    Module 4: Behavioral Drift Detector (`drift/drift_detector.py`) ✅ COMPLETE
+    Testing Module: Ransomware Simulator (`testing/ransomware_simulator.py`) ✅ COMPLETE
 
 Data flows sequentially: File Events -> Time-Slotted Windows -> Feature Vectors
 -> Drift Detection. Entropy Analysis runs asynchronously on file modification
@@ -139,12 +141,35 @@ Outputs:
 Alerts are printed with red/yellow visual markers directly to the terminal when
 drift is confirmed.
 
+--------------------------------------------------------------------------------
+MODULE 5: TESTING SIMULATOR (testing/ransomware_simulator.py)
+--------------------------------------------------------------------------------
+Architecture: Safe Sandbox File Generator
+Purpose: To generate controlled file-system activity for end-to-end testing of the
+         complete detection pipeline without risking actual system data.
+
+Implementation Mechanics:
+- Sandboxed Execution: All activity confined to `~/Documents/ransomware_test/`
+- Multiple Attack Modes:
+  * Normal: Slow, low-volume activity (baseline behavior)
+  * Bulk: High-volume creates and edits (no malicious renames)
+  * Ransomware: Base64-encode files → rename to .locked → delete original
+- File Generation: Creates realistic test files with various extensions
+  (.txt, .docx, .pdf, .xlsx, .jpg, .png, .csv)
+- Safety Features: Automatic cleanup option, never touches files outside sandbox
+
+Integration:
+Standalone testing tool that can be run while detection modules are active to
+validate the entire pipeline from file events through drift detection.
+
 ================================================================================
 3. SYSTEM ORCHESTRATION & RUNTIME
 ================================================================================
-Because Module 4 was decoupled, the system is designed to run in multiple terminals
-to reflect real microservice architecture:
+The system supports both multi-terminal microservice architecture and unified
+execution through individual module CLIs:
 
+OPTION A: Multi-Terminal Microservice Architecture
+--------------------------------------------------
 TERMINAL A (Data Generation & Extraction)
 Command: `python features/feature_extractor.py --mode realtime --window 10`
 Role: Starts the watchdog process, aggregates features every 10 seconds, runs
@@ -161,12 +186,60 @@ Role: Synthetically creates safe dummy files and mimics rapid encryption, enabli
 both the Entropy Analyzer and Drift Detector to trigger without relying on live
 malware.
 
+OPTION B: Individual Module Testing
+----------------------------------
+- File Monitoring: Integrated into feature extractor
+- Feature Extraction: `python features/feature_extractor.py --mode simulation`
+- Entropy Analysis: `python entropy/entropy_analyzer.py [file_path]`
+- Drift Detection: `python drift/drift_detector.py --mode demo`
+- Testing: `python testing/ransomware_simulator.py --mode [normal|bulk|ransomware]`
+
 ================================================================================
-4. FUTURE EXPANSION (Module 5 & Blockchain)
+4. IMPLEMENTATION STATUS & NEXT STEPS
 ================================================================================
-This architecture is specifically designed to support the upcoming Integration of
-Blockchain Evidence Logging:
-As Module 3 (Entropy) and Module 4 (Drift) flag anomalous conditions, those high-
-confidence JSON alert payloads can be cleanly hooked into a smart-contract emitter
-thread, guaranteeing immutable logging of the early-warning indicators exactly
-as they occurred.
+COMPLETED MODULES (✅):
+- File Monitoring: Full watchdog-based real-time monitoring with event filtering
+- Feature Extraction: Sliding window aggregation with configurable time windows
+- Entropy Analysis: Shannon entropy calculation with configurable thresholds
+- Drift Detection: Three-algorithm approach (Z-Score, ADWIN, Page-Hinkley)
+- Testing Simulator: Safe sandboxed ransomware simulation
+
+EMPTY DIRECTORIES (🚧):
+- blockchain/ : For evidence logging implementation
+- risk_engine/ : For risk scoring and aggregation
+- dashboard/ : For monitoring interface
+- database/ : For persistent storage
+- agent/ : For agentic decision system
+- anomaly_detection/ : For ML-based anomaly detection
+
+DEPENDENCIES:
+Current requirements.txt includes minimal dependencies (watchdog, psutil).
+Additional libraries needed for full functionality:
+- river: For ADWIN drift detection
+- numpy/pandas: For data processing
+- scikit-learn: For ML algorithms
+- web3: For blockchain integration
+
+================================================================================
+5. FUTURE EXPANSION ROADMAP
+================================================================================
+Phase 1 - Core Enhancements:
+- Implement unified main.py orchestration
+- Add risk scoring engine with weighted threat assessment
+- Create agentic decision system for automated response
+
+Phase 2 - Evidence & Monitoring:
+- Blockchain evidence logging for forensic integrity
+- Real-time monitoring dashboard with alert visualization
+- Database integration for historical analysis
+
+Phase 3 - Advanced Detection:
+- Machine learning-based anomaly detection
+- Federated learning across multiple endpoints
+- Graph-based process behavior modeling
+
+The current modular architecture is specifically designed to support seamless
+integration of these future components. As Module 3 (Entropy) and Module 4 (Drift)
+flag anomalous conditions, those high-confidence JSON alert payloads can be cleanly
+hooked into downstream modules for risk scoring, blockchain logging, and automated
+response actions.
