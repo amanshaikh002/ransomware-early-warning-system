@@ -1,0 +1,172 @@
+================================================================================
+Agentic AI-Based Ransomware Early-Warning System
+Implementation Details & Architecture Guide
+================================================================================
+
+This document outlines the detailed implementation, architecture, and orchestration
+of all modules within the Ransomware Early-Warning System.
+
+================================================================================
+1. SYSTEM ARCHITECTURE OVERVIEW
+================================================================================
+The system is designed as a modular, real-time pipeline that monitors filesystem
+behavior, extracts statistical features, analyzes file entropy for encryption
+signatures, and detects anomalous behavioral drift.
+
+The pipeline consists of four independent modules that operate concurrently:
+
+    Module 1: File Monitoring (`monitoring/file_watcher.py`)
+    Module 2: Feature Extraction (`features/feature_extractor.py`)
+    Module 3: Entropy Analyzer (`entropy/entropy_analyzer.py`)
+    Module 4: Behavioral Drift Detector (`drift/drift_detector.py`)
+
+Data flows sequentially: File Events -> Time-Slotted Windows -> Feature Vectors
+-> Drift Detection. Entropy Analysis runs asynchronously on file modification
+events triggered by the monitor.
+
+================================================================================
+2. MODULE IMPLEMENTATION DETAILS
+================================================================================
+
+--------------------------------------------------------------------------------
+MODULE 1: FILE MONITORING (monitoring/file_watcher.py)
+--------------------------------------------------------------------------------
+Architecture: Event-Driven Wrapper over `watchdog`
+Purpose: To monitor specified directories (e.g., Desktop, Documents, Downloads,
+         Pictures) for low-level filesystem events in real-time.
+
+Implementation Mechanics:
+- Library Used: `watchdog.observers.Observer`
+- Event Handlers: Overrides `FileSystemEventHandler` to capture `on_created`,
+  `on_modified`, `on_deleted`, and `on_moved` methods.
+- Threading: Runs continuously in a background threading loop.
+- Extensibility: Implements a callback architecture (`add_event_callback`).
+  Higher-level modules (like Module 2 and Module 3) register their callback
+  functions here to receive structured event dictionaries exactly as they occur.
+
+Output Event Structure (JSON-like dictionary):
+{
+  "timestamp": "2026-03-12T16:20:00.000000+00:00",
+  "event_type": "modified",
+  "file_path": "C:\\...",
+  "file_size": 1024,
+  "process_name": "python.exe" (mocked/extracted)
+}
+
+--------------------------------------------------------------------------------
+MODULE 2: FEATURE EXTRACTION (features/feature_extractor.py)
+--------------------------------------------------------------------------------
+Architecture: Time-Driven Sliding Window Aggregator
+Purpose: To transform raw, high-frequency file events into normalized, fixed-time
+         statistical feature vectors.
+
+Implementation Mechanics:
+- Synchronization: Uses `threading.Lock()` to ensure thread-safe ingestion of
+  events coming asynchronously from Module 1.
+- Time-Driven Logic: Uses a background daemon thread (`_timer_loop`) that sleeps
+  for `N` seconds (e.g., 10s or 20s). When it wakes, it forces the current window
+  to close and emit its aggregated data, regardless of whether any events occurred.
+- Aggregation: Uses `collections.Counter` and `collections.defaultdict` to track:
+  - Total files created, deleted, modified, renamed.
+  - Number of unique directories and file extensions touched.
+  - Write rates (total events / window duration).
+  - Minimum, maximum, and average file sizes.
+- Orchestration: Writes every completed feature vector as a line of JSON into an
+  append-only stream file: `feature_stream.jsonl` in the project root.
+
+Integration:
+Module 2 instantiates Module 1 directly, wiring its internal `add_event` method
+as a callback to the FileWatcher.
+
+--------------------------------------------------------------------------------
+MODULE 3: ENTROPY ANALYZER (entropy/entropy_analyzer.py)
+--------------------------------------------------------------------------------
+Architecture: Asynchronous Mathematical Analyzer
+Purpose: To detect the presence of encrypted files by analyzing data randomness
+         (Shannon Entropy). Ransomware heavily encrypts files, pushing their
+         entropy close to the theoretical maximum (8.0 bits per byte).
+
+Implementation Mechanics:
+- Math Engine: Reads file chunks (to handle large files without memory bloat) and
+  computes the byte frequency distribution. Uses the standard Shannon entropy
+  formula: `H = -sum(P(x) * log2(P(x)))`
+- Thresholding: Triggers a high-entropy alert if the calculated value exceeds a
+  configurable threshold (e.g., 7.5 bits/byte).
+- Resilience: Implements `FileNotFoundError` and `PermissionError` handling to
+  survive rapid rename/delete sequences typical of ransomware (e.g., where a file
+  is encrypted, renamed to `.locked`, and the original is deleted before the
+  entropy analyzer can open it).
+
+Integration:
+Module 2 optionally instantiates Module 3. If present, every `modified` and
+`renamed` event is passed to the EntropyAnalyzer for near-instant cryptographic
+validation.
+
+--------------------------------------------------------------------------------
+MODULE 4: BEHAVIORAL DRIFT DETECTOR (drift/drift_detector.py)
+--------------------------------------------------------------------------------
+Architecture: Standalone Streaming Anomaly Detector
+Purpose: To analyze the sequence of feature vectors (emitted by Module 2) and
+         detect abrupt or creeping shifts in baseline system behavior.
+
+Implementation Mechanics:
+File Tailing: Operates independently by continuously tailing `feature_stream.jsonl`.
+It uses a robust string-buffer loop to read incomplete JSON writes seamlessly across
+concurrent file accesses.
+
+Detection Algorithms:
+1. Z-Score (Statistical Spike Detection):
+   Maintains a rolling history (`collections.deque`) of the last 30 windows.
+   Calculates `mean` and `stdev`. If the incoming feature deviates by `|Z| > 3`,
+   an alert is generated. Ideal for massive, sudden ransomware bursts.
+
+2. ADWIN (Adaptive Windowing):
+   Uses the `river` library's `ADWIN` class. A sophisticated streaming algorithm
+   that automatically adjusts its internal history window and detects conceptual
+   distribution shifts without assuming normal data distributions.
+
+3. Page-Hinkley (Cumulative Sum Test):
+   A custom-built CUSUM implementation. Tracks the cumulative running sum of minute
+   deviations above the historical minimum. If the accumulated error exceeds a
+   threshold (e.g., 50.0), it trips. Ideal for "low and slow" ransomware evasions.
+
+Severity Scoring:
+- 1 detector triggered  => LOW severity
+- 2 detectors triggered => MEDIUM severity
+- 3 detectors triggered => HIGH severity
+
+Outputs:
+Alerts are printed with red/yellow visual markers directly to the terminal when
+drift is confirmed.
+
+================================================================================
+3. SYSTEM ORCHESTRATION & RUNTIME
+================================================================================
+Because Module 4 was decoupled, the system is designed to run in multiple terminals
+to reflect real microservice architecture:
+
+TERMINAL A (Data Generation & Extraction)
+Command: `python features/feature_extractor.py --mode realtime --window 10`
+Role: Starts the watchdog process, aggregates features every 10 seconds, runs
+entropy analysis on files in the background, and dumps vectors to `feature_stream.jsonl`.
+
+TERMINAL B (Behavioral Analytics)
+Command: `python drift/drift_detector.py --mode realtime`
+Role: Silently tails `feature_stream.jsonl`. When a vector drops in, it runs
+Z-score, ADWIN, and Page-Hinkley to ensure behavior is normal.
+
+TERMINAL C (Testing / Attacking)
+Command: `python testing/ransomware_simulator.py --mode ransomware --count 40`
+Role: Synthetically creates safe dummy files and mimics rapid encryption, enabling
+both the Entropy Analyzer and Drift Detector to trigger without relying on live
+malware.
+
+================================================================================
+4. FUTURE EXPANSION (Module 5 & Blockchain)
+================================================================================
+This architecture is specifically designed to support the upcoming Integration of
+Blockchain Evidence Logging:
+As Module 3 (Entropy) and Module 4 (Drift) flag anomalous conditions, those high-
+confidence JSON alert payloads can be cleanly hooked into a smart-contract emitter
+thread, guaranteeing immutable logging of the early-warning indicators exactly
+as they occurred.
