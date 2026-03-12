@@ -211,6 +211,61 @@ Visualization
 
 ---
 
+## How to Run
+
+Here are the commands to run each module independently or as a combined detection pipeline. All commands should be run from the root of the project `ransomware-early-warning-system/`.
+
+### 1. File Monitoring (Module 1)
+To run the file watcher and print real-time events to the console:
+```bash
+python monitoring/file_watcher.py
+```
+
+### 2. Feature Extraction (Module 2)
+The feature extractor integrates with the file watcher to aggregate events into sliding windows.
+```bash
+# Run in real-time mode with a 10-second sliding window
+python features/feature_extractor.py --mode realtime --window 10
+
+# Run a built-in simulation demo
+python features/feature_extractor.py --mode simulation
+```
+
+### 3. Entropy Analysis (Module 3)
+To calculate the Shannon entropy of a specific file or run a built-in built-in demo.
+```bash
+# Analyze a specific file
+python entropy/entropy_analyzer.py path/to/suspicious_file.pdf
+
+# Run built-in demo with mock files (plain text vs simulated encrypted)
+python entropy/entropy_analyzer.py
+```
+
+### 4. End-to-End Testing (Simulator)
+Use the testing simulator to safely generate file system activity inside the sandboxed `~/Documents/ransomware_test/` folder and trigger the detection pipeline.
+
+**Terminal 1 (Start Detection Pipeline):**
+```bash
+python features/feature_extractor.py --mode realtime --window 10
+```
+
+**Terminal 2 (Run Simulator):**
+```bash
+# Normal slow user activity
+python testing/ransomware_simulator.py --mode normal --duration 30
+
+# Bulk file creation/modification (no malicious behavior)
+python testing/ransomware_simulator.py --mode bulk --count 30
+
+# Ransomware mode (base64-encode files -> rename to .locked -> delete original)
+python testing/ransomware_simulator.py --mode ransomware --count 15
+
+# Clean up sandbox folder after testing
+python testing/ransomware_simulator.py --cleanup
+```
+
+---
+
 ## Project Structure
 
 ```
