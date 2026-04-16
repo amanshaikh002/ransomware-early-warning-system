@@ -64,6 +64,11 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+# Keep extractor and simulator aligned to the same sandbox by default.
+WATCHED_DIRS: list[str] = [
+    r"C:\Users\aarya\OneDrive\Desktop\College stuff\VIT\TY\S6\CSAB\CP\ransomware_test"
+]
+
 
 # ===========================================================================
 #  FeatureExtractor
@@ -652,7 +657,9 @@ def _run_realtime(extractor: FeatureExtractor) -> None:
         logger.warning("Could not initialise stream file: %s", e)
 
     # Build the list of directories to watch
-    monitored_paths = get_default_monitored_paths()
+    monitored_paths = [d for d in WATCHED_DIRS if d]
+    if not monitored_paths:
+        monitored_paths = get_default_monitored_paths()
     if not monitored_paths:
         logger.error("No valid directories to monitor. Exiting.")
         sys.exit(1)
@@ -885,7 +892,7 @@ def main() -> None:
     if args.mode == "simulation":
         _run_simulation(extractor)
     else:
-        _run_realtime_from_event_stream(extractor)
+        _run_realtime(extractor)
 
 
 if __name__ == "__main__":
