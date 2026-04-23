@@ -1,17 +1,88 @@
-# Python cache
+# -------------------------------------------------------------------
+# Python bytecode and cache
+# -------------------------------------------------------------------
 __pycache__/
-*.pyc
-*.pyo
+*.py[cod]
 *.pyd
+*.pyo
+*.py,cover
+.python-version
 
-# Virtual environments
+# -------------------------------------------------------------------
+# Virtual environments and local Python tooling
+# -------------------------------------------------------------------
+.venv/
 venv/
+env/
+ENV/
 .env/
+.tox/
+.nox/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+.hypothesis/
+.coverage
+.coverage.*
+htmlcov/
 
-# OS files
+# -------------------------------------------------------------------
+# Build, packaging, and distribution outputs
+# -------------------------------------------------------------------
+build/
+dist/
+site/
+*.egg-info/
+.eggs/
+pip-wheel-metadata/
+
+# -------------------------------------------------------------------
+# Notebook artifacts
+# -------------------------------------------------------------------
+.ipynb_checkpoints/
+
+# -------------------------------------------------------------------
+# IDE and editor settings
+# -------------------------------------------------------------------
+.vscode/
+.idea/
+*.code-workspace
+
+# -------------------------------------------------------------------
+# Operating system files
+# -------------------------------------------------------------------
 .DS_Store
 Thumbs.db
+Desktop.ini
 
-# Logs
+# -------------------------------------------------------------------
+# Logs and runtime output
+# -------------------------------------------------------------------
 *.log
+*.out
+*.err
+*.stackdump
+
+# -------------------------------------------------------------------
+# Generated project artifacts
+# Keep the repository clean; these are produced at runtime.
+# -------------------------------------------------------------------
 *.jsonl
+*.pkl
+*.sqlite3
+*.db
+ransomware_monitor.db
+feature_stream.jsonl
+event_stream.jsonl
+entropy_alerts.jsonl
+risk_stream.jsonl
+incidents.jsonl
+evidence_chain.jsonl
+
+# -------------------------------------------------------------------
+# Local coverage and test reports
+# -------------------------------------------------------------------
+coverage.xml
+nosetests.xml
+pytestdebug.log

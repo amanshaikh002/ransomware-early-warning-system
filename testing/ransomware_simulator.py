@@ -24,7 +24,7 @@ Safety
 ------
 ALL activity is confined to::
 
-    ~/Documents/ransomware_test/
+    C:\\Users\\aarya\\OneDrive\\Desktop\\College stuff\\VIT\\TY\\S6\\CSAB\\CP\\ransomware_test
 
 The directory is created automatically and **no files outside it are
 ever touched**.
@@ -65,8 +65,8 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Sandbox directory — all simulated activity stays here.
-SANDBOX_DIR: str = os.path.join(
-    os.path.expanduser("~"), "Documents", "ransomware_test"
+SANDBOX_DIR: str = (
+    r"C:\Users\aarya\OneDrive\Desktop\College stuff\VIT\TY\S6\CSAB\CP\ransomware_test"
 )
 
 #: File extensions used to create realistic test files.
@@ -148,7 +148,34 @@ def _encrypt_file(filepath: str) -> str:
 
     # Step 4 — Rename extension to .locked
     locked_path = filepath + ".locked"
-    os.rename(filepath, locked_path)
+    last_error: OSError | None = None
+    for attempt in range(5):
+        try:
+            os.rename(filepath, locked_path)
+            last_error = None
+            break
+        except OSError as exc:
+            last_error = exc
+            if getattr(exc, "winerror", None) == 32 and attempt < 4:
+                time.sleep(0.25 * (attempt + 1))
+                continue
+            last_error = exc
+            break
+
+    if last_error is not None:
+        # On Windows, OneDrive/AV can briefly hold the file open.
+        # Fall back to writing the locked copy directly so the demo keeps running.
+        with open(locked_path, "wb") as fh:
+            fh.write(encoded)
+        try:
+            os.remove(filepath)
+        except OSError as exc:
+            if getattr(exc, "winerror", None) not in {32, 5}:
+                raise
+        logger.warning(
+            "🔁  Rename blocked, wrote fallback locked copy: %s",
+            os.path.basename(locked_path),
+        )
 
     logger.info(
         "🔒  Encrypted: %s → %s  (entropy ↑)",
@@ -316,7 +343,7 @@ def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
             "Ransomware Behaviour Simulator — generates controlled "
-            "file-system activity inside ~/Documents/ransomware_test/ "
+            "file-system activity inside C:\\Users\\aarya\\OneDrive\\Desktop\\College stuff\\VIT\\TY\\S6\\CSAB\\CP\\ransomware_test "
             "for end-to-end testing of the detection pipeline."
         ),
     )

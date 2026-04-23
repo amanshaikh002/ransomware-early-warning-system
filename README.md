@@ -337,9 +337,6 @@ Completed:
 * Feature Extraction Module
 * Entropy Analysis Engine
 * Testing Simulator
-
-Upcoming modules:
-
 * Behavioral Drift Detection
 * Isolation Forest Anomaly Detection
 * Risk Scoring Engine
