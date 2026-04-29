@@ -82,12 +82,34 @@ class EntropyAnalyzer:
     """
 
     # Default entropy threshold — files above this are flagged.
-    # Set to 4.5 so that base64-encoded (simulated encrypted) files are
-    # detected early even before entropy reaches near-maximum values.
-    DEFAULT_THRESHOLD: float = 4.5
+    # 7.2 targets genuinely AES/ChaCha20-encrypted content (7.9-8.0 bits/byte)
+    # while avoiding false positives from JPEG/MP3/zip files (7.0-7.8).
+    DEFAULT_THRESHOLD: float = 7.2
 
     # Default read chunk size (1 MB) for safe large-file handling
     DEFAULT_CHUNK_SIZE: int = 1_048_576  # 1 MB
+
+    # File extensions that are *naturally* high-entropy (compressed media,
+    # archives, modern Office) — entropy alone cannot distinguish them
+    # from ciphertext. Skip them unless they also carry a ransomware
+    # marker extension (see SUSPICIOUS_SUFFIXES).
+    NATURALLY_HIGH_ENTROPY_EXTENSIONS: set[str] = {
+        ".png", ".jpg", ".jpeg", ".gif", ".webp", ".heic", ".bmp",
+        ".mp3", ".mp4", ".mov", ".avi", ".mkv", ".webm", ".m4a", ".flac",
+        ".zip", ".gz", ".7z", ".rar", ".tar", ".bz2", ".xz", ".lz4",
+        ".iso", ".dmg",
+        ".docx", ".xlsx", ".pptx", ".odt", ".ods", ".odp",
+        ".pdf",
+    }
+
+    # Suffixes ransomware commonly appends after encryption. A file with
+    # any of these is ALWAYS analyzed regardless of the underlying
+    # extension — `.png.locked` should be flagged even though `.png`
+    # alone would be skipped.
+    SUSPICIOUS_SUFFIXES: set[str] = {
+        ".locked", ".crypto", ".crypted", ".enc", ".encrypted",
+        ".aes", ".cipher", ".cryp", ".pay", ".ransom",
+    }
 
     def __init__(
         self,
@@ -209,6 +231,36 @@ class EntropyAnalyzer:
                 locked_candidate = file_path + ".locked"
                 if os.path.isfile(locked_candidate):
                     file_path = locked_candidate
+
+            # Skip naturally-high-entropy file types unless they carry a
+            # ransomware marker suffix. Real PNG/MP3/ZIP files routinely
+            # exceed any reasonable entropy threshold, so analyzing them
+            # produces constant false positives. .png.locked etc. still
+            # fall through to full analysis because the suspicious suffix
+            # check below takes priority.
+            lower_path = file_path.lower()
+            has_suspicious_suffix = any(
+                lower_path.endswith(suf) for suf in self.SUSPICIOUS_SUFFIXES
+            )
+            base_ext = os.path.splitext(lower_path)[1]
+            if (
+                not has_suspicious_suffix
+                and base_ext in self.NATURALLY_HIGH_ENTROPY_EXTENSIONS
+            ):
+                logger.debug(
+                    "Skipping entropy analysis for naturally high-entropy file: %s",
+                    file_path,
+                )
+                result = {
+                    "file_path": file_path,
+                    "entropy": None,
+                    "entropy_flag": False,
+                    "threshold": self._threshold,
+                    "timestamp": timestamp,
+                    "skipped_reason": "naturally_high_entropy_extension",
+                }
+                self._results.append(result)
+                return result
 
             entropy = self.compute_entropy(file_path)
             file_size = os.path.getsize(file_path)

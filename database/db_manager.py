@@ -174,6 +174,23 @@ class DatabaseManager:
             rows = cursor.fetchall()
         return [dict(row) for row in rows]
 
+    def prune_table(self, table: str, max_records: int = 10_000) -> int:
+        """
+        Delete the oldest rows from table, keeping at most max_records.
+        Returns the number of rows deleted.
+        """
+        valid_tables = {"file_events", "drift_alerts", "risk_scores", "entropy_alerts"}
+        if table not in valid_tables:
+            raise ValueError(f"Unsupported table: {table}")
+        with self._lock:
+            cursor = self._conn.execute(
+                f"DELETE FROM {table} WHERE id NOT IN "
+                f"(SELECT id FROM {table} ORDER BY id DESC LIMIT ?)",
+                (max_records,),
+            )
+            self._conn.commit()
+            return cursor.rowcount
+
     def close(self) -> None:
         with self._lock:
             self._conn.close()

@@ -185,6 +185,45 @@
       cursor: not-allowed;
     }
 
+    .sim-actions {
+      display: flex;
+      flex-direction: column;
+      gap: 0.5rem;
+      margin-top: 0.4rem;
+    }
+
+    .sim-actions button {
+      width: 100%;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.55rem 0.7rem;
+      font-size: 0.9rem;
+      font-weight: 600;
+      cursor: pointer;
+    }
+
+    .sim-actions .start-btn {
+      background: #0b5c8f;
+      color: #fff;
+      border-color: #0b5c8f;
+    }
+
+    .sim-actions .stop-btn {
+      background: #fff;
+      color: var(--danger);
+      border-color: var(--danger);
+    }
+
+    .sim-actions .stop-btn:hover:not(:disabled) {
+      background: var(--danger);
+      color: #fff;
+    }
+
+    .sim-actions button:disabled {
+      opacity: 0.5;
+      cursor: not-allowed;
+    }
+
     .sim-status {
       font-size: 0.88rem;
       color: var(--muted);
@@ -263,7 +302,10 @@
         </div>
         <div>
           <label>&nbsp;</label>
-          <button id="startSimBtn" type="button">Start Simulation</button>
+          <div class="sim-actions">
+            <button id="startSimBtn" class="start-btn" type="button">Start Simulation</button>
+            <button id="stopSimBtn" class="stop-btn" type="button" disabled>Stop &amp; Cleanup Sandbox</button>
+          </div>
         </div>
       </div>
       <div id="simStatus" class="sim-status">Idle</div>
@@ -286,6 +328,51 @@
         </table>
       </div>
     </section>
+
+    <section class="card" style="grid-column: 1 / -1;">
+      <div class="status-row" style="margin-bottom: 0.6rem;">
+        <h3 style="margin: 0;">Re-verification Report</h3>
+        <div style="display: flex; gap: 0.5rem;">
+          <button id="injectDecoyBtn" type="button" title="Drop a low-entropy .locked file into the sandbox so the audit reports it as MISSED" style="border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.8rem; background: #fff; cursor: pointer; font-weight: 600; font-size: 0.85rem;">Inject Decoy</button>
+          <button id="reverifyBtn" type="button" style="border: 1px solid var(--border); border-radius: 8px; padding: 0.4rem 0.8rem; background: #fff; cursor: pointer; font-weight: 600; font-size: 0.85rem;">Run Now</button>
+        </div>
+      </div>
+      <div id="reverifyEmpty" style="color: var(--muted); font-size: 0.9rem;">
+        No report yet — runs automatically when a ransomware simulation completes.
+      </div>
+      <div id="reverifySummary" style="display: none;">
+        <div class="status-row" style="margin-bottom: 0.8rem;">
+          <div>Locked Files: <strong id="rvTotal">0</strong></div>
+          <div>Caught: <strong id="rvCaught" style="color: var(--ok);">0</strong></div>
+          <div>Missed: <strong id="rvMissed" style="color: var(--danger);">0</strong></div>
+          <div>Coverage: <strong id="rvCoverage">0%</strong></div>
+          <div style="font-size: 0.8rem; color: var(--muted);">Generated: <span id="rvTimestamp">—</span></div>
+        </div>
+        <div style="font-size: 0.85rem; color: var(--muted); margin-bottom: 0.6rem;">
+          Detector hits this session — Entropy: <strong id="rvEntropyHits">0</strong> ·
+          Drift: <strong id="rvDriftHits">0</strong> ·
+          IsolationForest: <strong id="rvIfHits">0</strong>
+        </div>
+        <div id="rvMissedSection" style="display: none;">
+          <h4 style="margin: 0.4rem 0;">Missed files and reasons</h4>
+          <div class="scroll">
+            <table>
+              <thead>
+                <tr>
+                  <th>File</th>
+                  <th>Size</th>
+                  <th>Reason</th>
+                </tr>
+              </thead>
+              <tbody id="rvMissedBody"></tbody>
+            </table>
+          </div>
+        </div>
+        <div id="rvAllCaught" style="display: none; color: var(--ok); font-weight: 600;">
+          ✓ Every locked file was flagged by at least one detector.
+        </div>
+      </div>
+    </section>
   </div>
 
   <script>
@@ -300,7 +387,23 @@
     const simCount = document.getElementById("simCount");
     const simDuration = document.getElementById("simDuration");
     const startSimBtn = document.getElementById("startSimBtn");
+    const stopSimBtn = document.getElementById("stopSimBtn");
     const simStatus = document.getElementById("simStatus");
+    const reverifyBtn = document.getElementById("reverifyBtn");
+    const injectDecoyBtn = document.getElementById("injectDecoyBtn");
+    const reverifyEmpty = document.getElementById("reverifyEmpty");
+    const reverifySummary = document.getElementById("reverifySummary");
+    const rvTotal = document.getElementById("rvTotal");
+    const rvCaught = document.getElementById("rvCaught");
+    const rvMissed = document.getElementById("rvMissed");
+    const rvCoverage = document.getElementById("rvCoverage");
+    const rvTimestamp = document.getElementById("rvTimestamp");
+    const rvEntropyHits = document.getElementById("rvEntropyHits");
+    const rvDriftHits = document.getElementById("rvDriftHits");
+    const rvIfHits = document.getElementById("rvIfHits");
+    const rvMissedSection = document.getElementById("rvMissedSection");
+    const rvMissedBody = document.getElementById("rvMissedBody");
+    const rvAllCaught = document.getElementById("rvAllCaught");
 
     const chart = new Chart(document.getElementById("riskChart"), {
       type: "line",
@@ -361,6 +464,7 @@
       };
 
       startSimBtn.disabled = true;
+      stopSimBtn.disabled = false;
       simStatus.textContent = `Starting ${payload.mode} simulation...`;
 
       try {
@@ -374,6 +478,7 @@
         if (!res.ok || !result.ok) {
           simStatus.textContent = `Start failed: ${result.error || "unknown_error"}`;
           startSimBtn.disabled = false;
+          stopSimBtn.disabled = true;
           return;
         }
 
@@ -381,6 +486,125 @@
       } catch (err) {
         simStatus.textContent = "Start failed: network error";
         startSimBtn.disabled = false;
+        stopSimBtn.disabled = true;
+      }
+    }
+
+    async function stopSimulation() {
+      stopSimBtn.disabled = true;
+      simStatus.textContent = "Stopping simulation and cleaning sandbox...";
+
+      try {
+        const res = await fetch("/api/stop_simulation", { method: "POST" });
+        const result = await res.json();
+
+        if (!res.ok || !result.ok) {
+          if (result.error === "no_simulation_running") {
+            simStatus.textContent = "Idle — nothing to stop";
+          } else {
+            simStatus.textContent = `Stop failed: ${result.error || "unknown_error"}`;
+            stopSimBtn.disabled = false;
+          }
+          return;
+        }
+
+        simStatus.textContent = `Stopping ${result.stopped_mode || ""} — sandbox will be cleaned up`;
+      } catch (err) {
+        simStatus.textContent = "Stop failed: network error";
+        stopSimBtn.disabled = false;
+      }
+    }
+
+    function renderReverification(report) {
+      if (!report) {
+        reverifyEmpty.style.display = "block";
+        reverifySummary.style.display = "none";
+        return;
+      }
+      reverifyEmpty.style.display = "none";
+      reverifySummary.style.display = "block";
+
+      rvTotal.textContent = report.total_locked_files ?? 0;
+      rvCaught.textContent = report.caught_count ?? 0;
+      rvMissed.textContent = report.missed_count ?? 0;
+      rvCoverage.textContent = `${report.coverage_percent ?? 0}%`;
+      rvTimestamp.textContent = (report.timestamp || "").replace("T", " ").slice(0, 19) + " UTC";
+
+      const det = report.detector_summary || {};
+      rvEntropyHits.textContent = det.entropy_alerts_high ?? 0;
+      rvDriftHits.textContent = det.drift_alerts_fired ?? 0;
+      rvIfHits.textContent = det.iforest_anomalies ?? 0;
+
+      const missed = report.missed_files || [];
+      rvMissedBody.innerHTML = "";
+      if (missed.length === 0) {
+        rvMissedSection.style.display = "none";
+        rvAllCaught.style.display = (report.total_locked_files > 0) ? "block" : "none";
+      } else {
+        rvAllCaught.style.display = "none";
+        rvMissedSection.style.display = "block";
+        missed.forEach((item) => {
+          const row = document.createElement("tr");
+          const fileName = (item.file_path || "").split(/[\\/]/).pop();
+          const reasons = (item.reasons || []).map((r) =>
+            `<li style="margin-bottom: 0.2rem;">${r}</li>`
+          ).join("");
+          row.innerHTML = `
+            <td title="${item.file_path || ""}" style="max-width: 280px; overflow: hidden; text-overflow: ellipsis;">${fileName}</td>
+            <td>${item.size ?? 0}</td>
+            <td><ul style="margin: 0; padding-left: 1.1rem; font-size: 0.85rem;">${reasons}</ul></td>
+          `;
+          rvMissedBody.appendChild(row);
+        });
+      }
+    }
+
+    async function fetchReverification() {
+      try {
+        const res = await fetch("/api/reverification", { cache: "no-store" });
+        const data = await res.json();
+        renderReverification(data.report);
+      } catch (err) {
+        console.error("Re-verification fetch failed", err);
+      }
+    }
+
+    async function reverifyNow() {
+      reverifyBtn.disabled = true;
+      const originalLabel = reverifyBtn.textContent;
+      reverifyBtn.textContent = "Running…";
+      try {
+        const res = await fetch("/api/reverify_now", { method: "POST" });
+        const data = await res.json();
+        if (data.ok && data.report) {
+          renderReverification(data.report);
+        }
+      } catch (err) {
+        console.error("Re-verify now failed", err);
+      } finally {
+        reverifyBtn.disabled = false;
+        reverifyBtn.textContent = originalLabel;
+      }
+    }
+
+    async function injectDecoy() {
+      injectDecoyBtn.disabled = true;
+      const originalLabel = injectDecoyBtn.textContent;
+      injectDecoyBtn.textContent = "Injecting…";
+      try {
+        const res = await fetch("/api/inject_decoy_missed", { method: "POST" });
+        const data = await res.json();
+        if (data.ok) {
+          // Give the watcher a moment to ingest the new file before re-auditing.
+          setTimeout(reverifyNow, 1500);
+        } else {
+          console.error("Inject decoy failed", data);
+        }
+      } catch (err) {
+        console.error("Inject decoy failed", err);
+      } finally {
+        injectDecoyBtn.disabled = false;
+        injectDecoyBtn.textContent = originalLabel;
       }
     }
 
@@ -400,6 +624,7 @@
 
         const simRunning = Boolean(data.simulator_running);
         startSimBtn.disabled = simRunning;
+        stopSimBtn.disabled = !simRunning;
         if (simRunning) {
           simStatus.textContent = `Simulation running: ${data.simulator_mode || "unknown"}`;
         } else if (data.simulator_last_error) {
@@ -420,8 +645,13 @@
     }
 
     startSimBtn.addEventListener("click", startSimulation);
+    stopSimBtn.addEventListener("click", stopSimulation);
+    reverifyBtn.addEventListener("click", reverifyNow);
+    injectDecoyBtn.addEventListener("click", injectDecoy);
     refreshStatus();
+    fetchReverification();
     setInterval(refreshStatus, 5000);
+    setInterval(fetchReverification, 7000);
   </script>
 </body>
 </html>

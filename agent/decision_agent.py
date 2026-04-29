@@ -6,7 +6,9 @@ import argparse
 import json
 import logging
 import os
+import platform
 import stat
+import subprocess
 import threading
 import time
 from datetime import datetime, timezone
@@ -27,20 +29,25 @@ class DecisionAgent:
         self,
         risk_stream_path: str | None = None,
         incidents_path: str | None = None,
-        sandbox_path: str | None = None,
+        monitored_paths: list[str] | None = None,
+        process_names_getter=None,
         stop_event: threading.Event | None = None,
     ) -> None:
         project_root = Path(__file__).resolve().parent.parent
         self.risk_stream_path = Path(risk_stream_path) if risk_stream_path else project_root / "risk_stream.jsonl"
         self.incidents_path = Path(incidents_path) if incidents_path else project_root / "incidents.jsonl"
-        self.sandbox_path = Path(sandbox_path) if sandbox_path else Path.home() / "Documents" / "ransomware_test"
+        self.monitored_paths = (
+            [Path(p) for p in monitored_paths]
+            if monitored_paths
+            else [Path.home() / "Documents" / "ransomware_test"]
+        )
+        self._get_process_names = process_names_getter or (lambda: set())
+        self._suspended_pids: list[int] = []
         self.stop_event = stop_event or threading.Event()
-
         self._state = self.MONITORING
         self._consecutive_high = 0
         self._consecutive_below_30 = 0
         self._recovering_normal_windows = 0
-
         self._ensure_file(self.risk_stream_path)
         self._ensure_file(self.incidents_path)
 
@@ -70,34 +77,115 @@ class DecisionAgent:
         print(f"  Score : {payload.get('score')}")
         print("=" * 68 + "\n")
 
+    def _suspend_suspicious_processes(self) -> None:
+        """Suspend processes identified as suspicious via the shared tracker."""
+        import psutil
+        names = self._get_process_names()
+        if not names:
+            logger.warning("No suspicious process names available for suspension.")
+            return
+        for proc in psutil.process_iter(["pid", "name"]):
+            try:
+                if proc.info["name"] in names:
+                    proc.suspend()
+                    self._suspended_pids.append(proc.info["pid"])
+                    logger.warning("Suspended PID %d (%s)", proc.info["pid"], proc.info["name"])
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+
+    def _resume_suspended_processes(self) -> None:
+        """Resume all previously suspended processes."""
+        import psutil
+        for pid in self._suspended_pids:
+            try:
+                psutil.Process(pid).resume()
+                logger.info("Resumed PID %d", pid)
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+        self._suspended_pids.clear()
+
+    def _lock_directory_windows(self, path: Path) -> bool:
+        try:
+            result = subprocess.run(
+                ["icacls", str(path), "/deny", "Everyone:(W,D,DC)", "/T"],
+                capture_output=True, text=True, timeout=10,
+            )
+            if result.returncode != 0:
+                logger.error("icacls lock failed: %s", result.stderr.strip())
+                return False
+            logger.info("icacls locked: %s", path)
+            return True
+        except (subprocess.TimeoutExpired, FileNotFoundError) as exc:
+            logger.error("icacls unavailable: %s", exc)
+            return False
+
+    def _unlock_directory_windows(self, path: Path) -> bool:
+        try:
+            result = subprocess.run(
+                ["icacls", str(path), "/remove:d", "Everyone", "/T"],
+                capture_output=True, text=True, timeout=10,
+            )
+            return result.returncode == 0
+        except (subprocess.TimeoutExpired, FileNotFoundError):
+            return False
+
+    def _take_vss_snapshot(self) -> None:
+        """Attempt a Volume Shadow Copy of C:\\ on Windows for recovery capability."""
+        if platform.system() != "Windows":
+            return
+        try:
+            result = subprocess.run(
+                ["wmic", "shadowcopy", "call", "create", "Volume='C:\\\\'"],
+                capture_output=True, text=True, timeout=30,
+            )
+            logger.info("VSS snapshot: %s", result.stdout.strip())
+        except Exception as exc:
+            logger.warning("VSS snapshot failed (non-fatal): %s", exc)
+
     def _lock_sandbox(self) -> None:
-        self.sandbox_path.mkdir(parents=True, exist_ok=True)
-        mode = self.sandbox_path.stat().st_mode
-        mode &= ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
-        os.chmod(self.sandbox_path, mode)
-        logger.info("Locked sandbox directory: %s", self.sandbox_path)
+        for path in self.monitored_paths:
+            path.mkdir(parents=True, exist_ok=True)
+            if platform.system() == "Windows":
+                self._lock_directory_windows(path)
+            else:
+                for target in [path, *path.rglob("*")]:
+                    try:
+                        m = target.stat().st_mode
+                        target.chmod(m & ~(stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH))
+                    except OSError:
+                        pass
+            logger.info("Locked: %s", path)
 
     def _unlock_sandbox(self) -> None:
-        if not self.sandbox_path.exists():
-            return
-        mode = self.sandbox_path.stat().st_mode
-        mode |= stat.S_IWUSR
-        os.chmod(self.sandbox_path, mode)
-        logger.info("Unlocked sandbox directory: %s", self.sandbox_path)
+        for path in self.monitored_paths:
+            if not path.exists():
+                continue
+            if platform.system() == "Windows":
+                self._unlock_directory_windows(path)
+            else:
+                for target in [path, *path.rglob("*")]:
+                    try:
+                        m = target.stat().st_mode
+                        target.chmod(m | stat.S_IWUSR | stat.S_IWGRP | stat.S_IWOTH)
+                    except OSError:
+                        pass
+            logger.info("Unlocked: %s", path)
 
     def _transition(self, new_state: str, reason: str, payload: dict) -> None:
         previous = self._state
         self._state = new_state
         logger.info("DecisionAgent state %s -> %s (%s)", previous, new_state, reason)
-
         if new_state == self.ALERT:
             self._warning_banner(payload)
             self._write_incident("ALERT", payload)
+            self._take_vss_snapshot()
         elif new_state == self.RESPONDING:
             self._lock_sandbox()
+            self._suspend_suspicious_processes()
             self._write_incident("RESPONDING", payload)
         elif new_state == self.RECOVERING:
             self._unlock_sandbox()
+            self._resume_suspended_processes()
             self._write_incident("RECOVERING", payload)
 
     def _handle_window(self, risk_record: dict) -> None:

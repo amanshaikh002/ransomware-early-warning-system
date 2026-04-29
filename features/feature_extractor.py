@@ -65,9 +65,7 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 # Keep extractor and simulator aligned to the same sandbox by default.
-WATCHED_DIRS: list[str] = [
-    r"C:\Users\aarya\OneDrive\Desktop\College stuff\VIT\TY\S6\CSAB\CP\ransomware_test"
-]
+WATCHED_DIRS: list[str] = []
 
 
 # ===========================================================================

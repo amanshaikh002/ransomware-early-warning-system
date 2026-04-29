@@ -123,12 +123,12 @@ MONITORED_FEATURES: list[str] = [
 #: Minimum number of baseline windows required before Z-score detection starts.
 #: A small value improves responsiveness during short demos while still
 #: establishing a basic notion of "normal" behaviour.
-MIN_BASELINE_WINDOWS: int = 3
+MIN_BASELINE_WINDOWS: int = 10
 
 #: Default Z-score threshold for anomaly detection. Lowering this from 3.0 to
 #: 2.0 makes the detector more sensitive to sudden bursts in write_rate,
 #: files_modified, and rename_count that are characteristic of ransomware.
-Z_THRESHOLD: float = 2.0
+Z_THRESHOLD: float = 3.0
 
 #: Map severity label based on how many detectors fired.
 _SEVERITY_MAP: dict[int, str] = {0: "NONE", 1: "LOW", 2: "MEDIUM", 3: "HIGH"}
@@ -266,6 +266,23 @@ class DriftDetector:
             if z_flag:    overall_z_flag    = True
             if adwin_flag: overall_adwin_flag = True
             if ph_flag:   overall_ph_flag    = True
+
+        # ---- Suppress drift on idle windows ----
+        # If every monitored feature is exactly zero, nothing actually
+        # happened on the filesystem this window. Page-Hinkley CUSUM
+        # drifts on long zero-streams and produces spurious LOW alerts;
+        # ADWIN can also flag a "change" when activity finally appears
+        # for unrelated reasons. Real ransomware always has non-zero
+        # write_rate / files_modified / rename_count, so a fully-idle
+        # window is never an attack window.
+        is_idle_window = all(
+            float(feature_vector.get(feat, 0.0)) == 0.0
+            for feat in MONITORED_FEATURES
+        )
+        if is_idle_window:
+            overall_z_flag = False
+            overall_adwin_flag = False
+            overall_ph_flag = False
 
         # ---- Severity ----
         detectors_fired = sum([overall_z_flag, overall_adwin_flag, overall_ph_flag])

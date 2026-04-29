@@ -44,10 +44,10 @@ import time
 import json
 import random
 import string
-import base64
 import shutil
 import logging
 import argparse
+import threading
 from datetime import datetime, timezone
 
 # ---------------------------------------------------------------------------
@@ -65,8 +65,9 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 #: Sandbox directory — all simulated activity stays here.
-SANDBOX_DIR: str = (
-    r"C:\Users\aarya\OneDrive\Desktop\College stuff\VIT\TY\S6\CSAB\CP\ransomware_test"
+#: Must match the FileWatcher's monitored path (see monitoring/file_watcher.py:493).
+SANDBOX_DIR: str = os.path.join(
+    os.path.expanduser("~"), "Documents", "ransomware_test"
 )
 
 #: File extensions used to create realistic test files.
@@ -135,16 +136,16 @@ def _encrypt_file(filepath: str) -> str:
 
     Returns the path of the .locked file.
     """
-    # Step 1 — Read
-    with open(filepath, "rb") as fh:
-        raw = fh.read()
+    # Step 1 - Determine original file size
+    original_size = os.path.getsize(filepath)
 
-    # Step 2 — Encode (simulated encryption)
-    encoded = base64.b64encode(raw)
+    # Step 2 - Generate cryptographically random bytes (simulates AES-256 output)
+    # os.urandom produces ~7.99 bits/byte entropy, matching real ransomware output.
+    encrypted = os.urandom(max(original_size, 256))
 
-    # Step 3 — Overwrite with encoded content
+    # Step 3 - Overwrite original file with simulated ciphertext
     with open(filepath, "wb") as fh:
-        fh.write(encoded)
+        fh.write(encrypted)
 
     # Step 4 — Rename extension to .locked
     locked_path = filepath + ".locked"
@@ -166,7 +167,7 @@ def _encrypt_file(filepath: str) -> str:
         # On Windows, OneDrive/AV can briefly hold the file open.
         # Fall back to writing the locked copy directly so the demo keeps running.
         with open(locked_path, "wb") as fh:
-            fh.write(encoded)
+            fh.write(encrypted)
         try:
             os.remove(filepath)
         except OSError as exc:
@@ -189,7 +190,7 @@ def _encrypt_file(filepath: str) -> str:
 #  Simulation modes
 # ===========================================================================
 
-def run_normal(duration_seconds: int = 30) -> None:
+def run_normal(duration_seconds: int = 30, stop_event: threading.Event | None = None) -> None:
     """
     **Normal mode** — slow, low-volume user-like activity.
 
@@ -208,6 +209,9 @@ def run_normal(duration_seconds: int = 30) -> None:
     end_time = time.time() + duration_seconds
 
     while time.time() < end_time:
+        if stop_event is not None and stop_event.is_set():
+            logger.info("⏹  Normal mode interrupted by stop request.")
+            break
         # Randomly decide: create or modify
         if not created_files or random.random() < 0.6:
             fp = _create_file(sandbox)
@@ -217,12 +221,17 @@ def run_normal(duration_seconds: int = 30) -> None:
             _modify_file(fp)
 
         delay = random.uniform(2.0, 3.5)
-        time.sleep(delay)
+        if stop_event is not None:
+            if stop_event.wait(timeout=delay):
+                logger.info("⏹  Normal mode interrupted by stop request.")
+                break
+        else:
+            time.sleep(delay)
 
     print(f"\n✅  Normal mode complete — {len(created_files)} files created.\n")
 
 
-def run_bulk(file_count: int = 30) -> None:
+def run_bulk(file_count: int = 30, stop_event: threading.Event | None = None) -> None:
     """
     **Bulk mode** — rapid file creation and modification.
 
@@ -241,6 +250,9 @@ def run_bulk(file_count: int = 30) -> None:
     created_files: list[str] = []
     print("▶  Phase 1: Creating files …\n")
     for i in range(file_count):
+        if stop_event is not None and stop_event.is_set():
+            logger.info("⏹  Bulk mode interrupted by stop request.")
+            return
         fp = _create_file(sandbox)
         created_files.append(fp)
         time.sleep(random.uniform(0.05, 0.15))
@@ -250,6 +262,9 @@ def run_bulk(file_count: int = 30) -> None:
     targets = random.sample(created_files, modify_count)
     print(f"\n▶  Phase 2: Modifying {modify_count} files …\n")
     for fp in targets:
+        if stop_event is not None and stop_event.is_set():
+            logger.info("⏹  Bulk mode interrupted by stop request.")
+            return
         _modify_file(fp)
         time.sleep(random.uniform(0.05, 0.15))
 
@@ -257,7 +272,7 @@ def run_bulk(file_count: int = 30) -> None:
           f"{modify_count} modified.\n")
 
 
-def run_ransomware(file_count: int = 15) -> None:
+def run_ransomware(file_count: int = 15, stop_event: threading.Event | None = None) -> None:
     """
     **Ransomware mode** — simulates encryption behaviour.
 
@@ -284,6 +299,9 @@ def run_ransomware(file_count: int = 15) -> None:
     print("▶  Phase 1: Creating victim files …\n")
     victim_files: list[str] = []
     for _ in range(file_count):
+        if stop_event is not None and stop_event.is_set():
+            logger.info("⏹  Ransomware mode interrupted during Phase 1.")
+            break
         fp = _create_file(sandbox)
         victim_files.append(fp)
         time.sleep(random.uniform(0.1, 0.2))
@@ -294,6 +312,9 @@ def run_ransomware(file_count: int = 15) -> None:
     print("\n▶  Phase 2: Encrypting files (simulated) …\n")
     locked_files: list[str] = []
     for fp in victim_files:
+        if stop_event is not None and stop_event.is_set():
+            logger.info("⏹  Ransomware mode interrupted during Phase 2.")
+            break
         if os.path.isfile(fp):
             locked = _encrypt_file(fp)
             locked_files.append(locked)

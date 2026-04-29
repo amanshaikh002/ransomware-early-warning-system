@@ -35,7 +35,7 @@ import time
 import json
 import logging
 import threading
-from pathlib import PurePath
+from pathlib import Path, PurePath
 from datetime import datetime, timezone
 
 from watchdog.observers import Observer
@@ -97,6 +97,13 @@ IGNORE_FILES: set[str] = {
     "event_stream.jsonl",
     "feature_stream.jsonl",
     "entropy_alerts.jsonl",
+    "risk_stream.jsonl",
+    "drift_stream.jsonl",
+    "iforest_stream.jsonl",
+    "incidents.jsonl",
+    "evidence_chain.jsonl",
+    "ransomware_monitor.db",
+    "ransomware_monitor.db-journal",
 }
 
 
@@ -174,49 +181,31 @@ class _EventHandler(FileSystemEventHandler):
             return -1
 
     @staticmethod
-    def _get_process_info() -> tuple:
+    def _get_process_info(file_path: str) -> tuple[str, int]:
         """
-        Return (pid, process_name) of the *current* Python process.
+        Process attribution is intentionally a no-op on the watcher hot path.
 
-        Note
-        ----
-        watchdog delivers events asynchronously; reliably attributing
-        each event to the *external* process that caused the I/O change
-        is non-trivial on most OSes.  For research purposes we log the
-        monitoring process itself.  A production system could integrate
-        with OS audit logs (e.g., ETW on Windows, fanotify on Linux) for
-        accurate process attribution.
+        The previous implementation iterated every process via
+        psutil.process_iter(["open_files"]) per event. On Windows that hits
+        AccessDenied for most PIDs and takes hundreds of milliseconds per
+        event — fast enough to overflow watchdog's ReadDirectoryChangesW
+        buffer and drop events under load (e.g. ransomware bursts).
+
+        Accurate attribution requires OS audit logs (ETW / fanotify / auditd),
+        not user-space enumeration. Until that's wired up we return
+        ("unknown", -1) immediately so the watcher keeps up with the event
+        rate. The DecisionAgent's process tracker handles "unknown" gracefully.
         """
-        try:
-            proc = psutil.Process(os.getpid())
-            return proc.pid, proc.name()
-        except (psutil.NoSuchProcess, psutil.AccessDenied):
-            return os.getpid(), "unknown"
+        return "unknown", -1
 
     # ----- core event builder ---------------------------------------------
 
     def _build_event(self, event, event_type: str) -> dict:
-        """
-        Construct the canonical event dictionary.
-
-        Parameters
-        ----------
-        event      : watchdog event object
-        event_type : one of "created", "modified", "deleted", "renamed"
-
-        Returns
-        -------
-        dict   Structured event metadata.
-        """
-        # Determine the relevant file path
         file_path = event.src_path
-
-        # For rename / move events, include both old and new paths
         dest_path = getattr(event, "dest_path", None)
-
-        pid, pname = self._get_process_info()
-        file_size = self._get_file_size(dest_path or file_path)
-
+        target_path = dest_path or file_path
+        pname, pid = self._get_process_info(target_path)
+        file_size = self._get_file_size(target_path)
         event_dict = {
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "event_type": event_type,
@@ -225,11 +214,8 @@ class _EventHandler(FileSystemEventHandler):
             "process_id": pid,
             "process_name": pname,
         }
-
-        # Include destination path for rename events
         if dest_path:
             event_dict["dest_path"] = os.path.abspath(dest_path)
-
         return event_dict
 
     def _handle(self, event, event_type: str) -> dict:
@@ -486,28 +472,16 @@ class FileWatcher:
 #  Default monitored paths — common ransomware targets
 # ===========================================================================
 
-#: Dedicated sandbox directory used by the ransomware simulator.
-#: All monitored activity is confined to this path so internal project
-#: files (including JSONL streams) are not observed.
-
-WATCH_DIRECTORY: str = os.path.join(os.path.expanduser("~"), "Documents", "ransomware_test")
-
-
-
 def get_default_monitored_paths() -> list[str]:
-    """
-    Return the default directory to monitor.
-
-    For this project we restrict monitoring to the ransomware simulator
-    sandbox directory so that project files (including the event and
-    feature streams) are never observed.
-
-    Returns
-    -------
-    list[str]
-        A single-item list containing :data:`WATCH_DIRECTORY`.
-    """
-    return [WATCH_DIRECTORY]
+    """Return existing standard user directories that ransomware targets."""
+    home = Path.home()
+    targets = ["Desktop", "Documents", "Downloads", "Pictures"]
+    paths = [str(home / name) for name in targets if (home / name).is_dir()]
+    if not paths:
+        fallback = home / "Documents" / "ransomware_test"
+        fallback.mkdir(parents=True, exist_ok=True)
+        paths.append(str(fallback))
+    return paths
 
 
 # ===========================================================================

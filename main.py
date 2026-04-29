@@ -7,6 +7,7 @@ import json
 import logging
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 
 from agent.decision_agent import DecisionAgent
@@ -28,6 +29,11 @@ logging.basicConfig(
 	datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger(__name__)
+
+
+_suspicious_lock = threading.Lock()
+_seen_process_names: set[str] = set()
+_IGNORED_PNAMES = {"python.exe", "python3", "python", "unknown", ""}
 
 
 def _ensure_file(path: Path) -> None:
@@ -80,6 +86,13 @@ def _run_file_pipeline(
 				threshold=float(entropy_result.get("threshold", 0.0)),
 			)
 
+		pname = str(event.get("process_name", ""))
+		if pname and pname not in _IGNORED_PNAMES:
+			with _suspicious_lock:
+				_seen_process_names.add(pname)
+				if len(_seen_process_names) > 50:
+					_seen_process_names.clear()
+
 	watcher.add_event_callback(_on_event)
 	watcher.start()
 	extractor.start_window_timer()
@@ -96,6 +109,7 @@ def _run_drift_pipeline(
 	detector: DriftDetector,
 	feature_stream: Path,
 	database: DatabaseManager,
+	drift_stream: Path,
 	stop_event: threading.Event,
 ) -> None:
 	def _consume(vector: dict) -> None:
@@ -111,15 +125,30 @@ def _run_drift_pipeline(
 				detectors_fired=int(result.get("detectors_fired", 0)),
 			)
 
+		drift_record = {
+			"timestamp": result.get("timestamp", ""),
+			"severity": result.get("severity", "NONE"),
+			"detectors_fired": result.get("detectors_fired", 0),
+		}
+		try:
+			with drift_stream.open("a", encoding="utf-8") as fh:
+				fh.write(json.dumps(drift_record, separators=(",", ":")) + "\n")
+		except OSError as exc:
+			logger.error("Failed to write drift record: %s", exc)
+
 	_tail_jsonl(feature_stream, stop_event, _consume, from_end=True)
 
 
 def _run_iforest_pipeline(
 	detector: IsolationForestDetector,
 	feature_stream: Path,
+	iforest_stream: Path,
 	stop_event: threading.Event,
 ) -> None:
 	_ensure_file(feature_stream)
+	_ensure_file(iforest_stream)
+	samples: list[dict] = []
+	trained = detector.model is not None
 	with feature_stream.open("r", encoding="utf-8") as handle:
 		handle.seek(0, 2)
 		while not stop_event.is_set():
@@ -130,9 +159,42 @@ def _run_iforest_pipeline(
 			try:
 				vector = json.loads(line.strip())
 			except json.JSONDecodeError:
-				logger.warning("Skipping malformed feature vector line in IF pipeline")
+				logger.warning("Skipping malformed feature vector in IF pipeline")
 				continue
-			detector.detect(vector)
+			if not trained:
+				samples.append(vector)
+				trained = detector.train_from_vectors(samples)
+				if trained:
+					logger.info("IsolationForest trained on %d samples", len(samples))
+				continue
+			result = detector.detect(vector)
+			result["timestamp"] = vector.get("window_end", "")
+			try:
+				with iforest_stream.open("a", encoding="utf-8") as fh:
+					fh.write(json.dumps(result, separators=(",", ":")) + "\n")
+			except OSError as exc:
+				logger.error("Failed to write iforest result: %s", exc)
+			logger.info(
+				"IsolationForest: anomaly=%s confidence=%.3f",
+				result["anomaly"], result["confidence"],
+			)
+
+
+def _run_db_pruner(database: DatabaseManager, stop_event: threading.Event) -> None:
+	"""Prune each table to at most 10 000 rows every 10 minutes."""
+	tables = ("file_events", "drift_alerts", "risk_scores", "entropy_alerts")
+	while not stop_event.is_set():
+		for _ in range(600):
+			if stop_event.is_set():
+				return
+			time.sleep(1)
+		for table in tables:
+			try:
+				deleted = database.prune_table(table, max_records=10_000)
+				if deleted:
+					logger.info("Pruned %d rows from %s", deleted, table)
+			except Exception as exc:
+				logger.warning("Pruning failed for %s: %s", table, exc)
 
 
 def _run_risk_db_sink(risk_stream: Path, database: DatabaseManager, stop_event: threading.Event) -> None:
@@ -207,19 +269,62 @@ def main() -> None:
 	feature_stream = project_root / "feature_stream.jsonl"
 	entropy_alerts = project_root / "entropy_alerts.jsonl"
 	risk_stream = project_root / "risk_stream.jsonl"
+	drift_stream = project_root / "drift_stream.jsonl"
+	iforest_stream = project_root / "iforest_stream.jsonl"
+	incidents_stream = project_root / "incidents.jsonl"
+	reverification_report = project_root / "reverification_report.jsonl"
 
-	for path in [event_stream, feature_stream, entropy_alerts, risk_stream]:
+	# Truncate all live streams so the dashboard starts each session clean.
+	# The blockchain ledger (evidence_chain.jsonl) is intentionally preserved
+	# — it's the immutable forensic record across sessions.
+	for path in [event_stream, feature_stream, entropy_alerts, risk_stream,
+	             drift_stream, iforest_stream, incidents_stream,
+	             reverification_report]:
 		_ensure_file(path)
+		try:
+			path.write_text("", encoding="utf-8")
+		except OSError as exc:
+			logger.warning("Could not truncate %s: %s", path, exc)
 
 	stop_event = threading.Event()
 	database = DatabaseManager(str(project_root / "ransomware_monitor.db"))
 
+	# Wipe the operational tables so the dashboard's "current" reflects
+	# this session, not the previous one. Schema and indexes survive.
+	for table in ("file_events", "drift_alerts", "risk_scores", "entropy_alerts"):
+		try:
+			database.prune_table(table, max_records=0)
+		except Exception as exc:  # noqa: BLE001
+			logger.warning("Could not reset table %s: %s", table, exc)
+
+	# Seed a clean baseline so /api/status returns NORMAL/0 from the very
+	# first poll, before any feature window has had a chance to close.
+	now_iso = datetime.now(timezone.utc).isoformat()
+	database.insert_risk_score(
+		timestamp=now_iso,
+		score=0.0,
+		level="NORMAL",
+		entropy_flag=0,
+		triggered_response=0,
+	)
+	with incidents_stream.open("a", encoding="utf-8") as fh:
+		fh.write(json.dumps({
+			"timestamp": now_iso,
+			"event": "MONITORING",
+			"state": "MONITORING",
+			"payload": {"reason": "session_start"},
+		}, separators=(",", ":")) + "\n")
+
 	monitored_paths = get_default_monitored_paths()
+	sandbox_dir = str(Path.home() / "Documents" / "ransomware_test")
+	Path(sandbox_dir).mkdir(parents=True, exist_ok=True)
+	if sandbox_dir not in monitored_paths:
+		monitored_paths.append(sandbox_dir)
 	watcher = FileWatcher(monitored_paths, stream_file=str(event_stream))
-	extractor = FeatureExtractor(window_seconds=10)
+	extractor = FeatureExtractor(window_seconds=5)
 	extractor.stream_file = str(feature_stream)
 
-	entropy_analyzer = EntropyAnalyzer(threshold=4.5)
+	entropy_analyzer = EntropyAnalyzer(threshold=7.2)
 	entropy_analyzer.alerts_file = str(entropy_alerts)
 	entropy_analyzer.alerts_path = str(entropy_alerts)
 
@@ -229,11 +334,20 @@ def main() -> None:
 		feature_stream_path=str(feature_stream),
 		entropy_alerts_path=str(entropy_alerts),
 		risk_stream_path=str(risk_stream),
+		drift_stream_path=str(drift_stream),
+		iforest_stream_path=str(iforest_stream),
 		stop_event=stop_event,
 	)
+	# IMPORTANT: only the sandbox is given to the agent for locking.
+	# Locking real user folders (Desktop / Documents / Downloads / Pictures)
+	# with `icacls /deny Everyone:(W,D,DC) /T` makes them unusable from
+	# File Explorer until manually unlocked. The watcher still observes
+	# those folders for detection, but defensive responses are confined to
+	# the sandbox so a false alarm can never lock a user out of their data.
 	decision_agent = DecisionAgent(
 		risk_stream_path=str(risk_stream),
-		sandbox_path=(monitored_paths[0] if monitored_paths else None),
+		monitored_paths=[sandbox_dir],
+		process_names_getter=lambda: set(_seen_process_names),
 		stop_event=stop_event,
 	)
 	evidence_logger = BlockchainEvidenceLogger(
@@ -250,15 +364,21 @@ def main() -> None:
 		),
 		threading.Thread(
 			target=_run_drift_pipeline,
-			args=(drift_detector, feature_stream, database, stop_event),
+			args=(drift_detector, feature_stream, database, drift_stream, stop_event),
 			daemon=True,
 			name="DriftDetectorThread",
 		),
 		threading.Thread(
 			target=_run_iforest_pipeline,
-			args=(iforest_detector, feature_stream, stop_event),
+			args=(iforest_detector, feature_stream, iforest_stream, stop_event),
 			daemon=True,
 			name="IsolationForestThread",
+		),
+		threading.Thread(
+			target=_run_db_pruner,
+			args=(database, stop_event),
+			daemon=True,
+			name="DbPrunerThread",
 		),
 		threading.Thread(
 			target=risk_scorer.run,

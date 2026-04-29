@@ -38,6 +38,29 @@ class BlockchainEvidenceLogger:
         self.risk_stream_path.parent.mkdir(parents=True, exist_ok=True)
         self.risk_stream_path.touch(exist_ok=True)
 
+        self._last_hash: str = "0" * 64
+        self._next_index: int = 0
+        self._load_chain_tip()
+
+    def _load_chain_tip(self) -> None:
+        """Seed in-memory tip from the last line of the chain file. O(n) once at startup."""
+        if not self.chain_path.exists() or self.chain_path.stat().st_size == 0:
+            return
+        last_line = ""
+        with self.chain_path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                stripped = line.strip()
+                if stripped:
+                    last_line = stripped
+        if not last_line:
+            return
+        try:
+            block = json.loads(last_line)
+            self._last_hash = str(block.get("block_hash", "0" * 64))
+            self._next_index = int(block.get("index", -1)) + 1
+        except (json.JSONDecodeError, ValueError):
+            pass
+
     @staticmethod
     def _sha256(data: str) -> str:
         return hashlib.sha256(data.encode("utf-8")).hexdigest()
@@ -60,25 +83,21 @@ class BlockchainEvidenceLogger:
                 blocks.append(json.loads(line))
         return blocks
 
-    def add_alert(self, alert_type: str, severity: str, payload: dict[str, Any]) -> dict[str, Any]:
-        blocks = self._read_all_blocks()
-        prev_hash = "0" * 64 if not blocks else str(blocks[-1]["block_hash"])
-        index = len(blocks)
-
+    def add_alert(self, alert_type: str, severity: str, payload: dict) -> dict:
         block = {
-            "index": index,
+            "index": self._next_index,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "alert_type": alert_type,
             "severity": severity,
             "payload": payload,
             "payload_hash": self._payload_hash(payload),
-            "prev_hash": prev_hash,
+            "prev_hash": self._last_hash,
         }
         block["block_hash"] = self._block_hash(block)
-
-        with self.chain_path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(block, separators=(",", ":")) + "\n")
-
+        with self.chain_path.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(block, separators=(",", ":")) + "\n")
+        self._last_hash = block["block_hash"]
+        self._next_index += 1
         return block
 
     def verify_chain(self) -> bool:
