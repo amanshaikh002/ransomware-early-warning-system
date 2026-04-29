@@ -336,12 +336,47 @@ def run_ransomware(file_count: int = 15, stop_event: threading.Event | None = No
 # ===========================================================================
 
 def cleanup_sandbox() -> None:
-    """Remove all files inside the sandbox directory."""
-    if os.path.isdir(SANDBOX_DIR):
+    """
+    Remove the sandbox directory.
+
+    If the DecisionAgent ran `icacls /deny Everyone:(W,D,DC) /T` during a
+    RESPONDING transition and was killed before unlocking, the directory
+    is unreadable to shutil. We try a normal rmtree first; on failure,
+    remove the deny ACEs via icacls and retry once.
+    """
+    if not os.path.isdir(SANDBOX_DIR):
+        logger.info("Sandbox does not exist — nothing to clean.")
+        return
+
+    try:
         shutil.rmtree(SANDBOX_DIR)
         logger.info("🧹  Sandbox cleaned: %s", SANDBOX_DIR)
-    else:
-        logger.info("Sandbox does not exist — nothing to clean.")
+        return
+    except PermissionError as exc:
+        logger.warning("rmtree blocked (%s); attempting to unlock sandbox", exc)
+
+    import platform
+    import subprocess
+    if platform.system() == "Windows":
+        try:
+            subprocess.run(
+                ["icacls", SANDBOX_DIR, "/remove:d", "Everyone", "/T", "/C"],
+                capture_output=True, text=True, timeout=20,
+            )
+        except (subprocess.TimeoutExpired, FileNotFoundError) as sub_exc:
+            logger.error("icacls unlock failed: %s", sub_exc)
+
+    try:
+        shutil.rmtree(SANDBOX_DIR)
+        logger.info("🧹  Sandbox cleaned after unlock: %s", SANDBOX_DIR)
+    except OSError as exc:
+        logger.error(
+            "Sandbox cleanup still failed after unlock attempt: %s. "
+            "You may need to remove it manually with: "
+            "icacls \"%s\" /remove:d Everyone /T  &&  rmdir /s /q \"%s\"",
+            exc, SANDBOX_DIR, SANDBOX_DIR,
+        )
+        raise
 
 
 # ===========================================================================

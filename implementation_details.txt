@@ -3,282 +3,639 @@ Agentic AI-Based Ransomware Early-Warning System
 Implementation Details & Architecture Guide
 ================================================================================
 
-This document outlines the detailed implementation, architecture, and orchestration
-of all modules within the Ransomware Early-Warning System.
+This document describes the full end-to-end implementation of the ransomware
+early-warning system: file watching, feature extraction, entropy analysis,
+behavioral drift, ML anomaly detection, risk scoring, agentic response,
+blockchain evidence, persistence, web dashboard, and post-attack audit.
 
-CURRENT STATUS: Core detection pipeline fully implemented and operational.
+CURRENT STATUS: Complete and demo-ready. All modules implemented, orchestrated
+in a single process via `main.py`, with a live web dashboard at
+http://127.0.0.1:5000.
+
 ================================================================================
 1. SYSTEM ARCHITECTURE OVERVIEW
 ================================================================================
-The system is designed as a modular, real-time pipeline that monitors filesystem
-behavior, extracts statistical features, analyzes file entropy for encryption
-signatures, and detects anomalous behavioral drift.
 
-The pipeline consists of four fully implemented modules that operate concurrently:
+The system is a layered streaming pipeline. Each layer transforms or reacts to
+the previous layer's output via append-only JSONL streams (used as message
+queues) or direct in-process callbacks. Files flow through this chain:
 
-    Module 1: File Monitoring (`monitoring/file_watcher.py`) ✅ COMPLETE
-    Module 2: Feature Extraction (`features/feature_extractor.py`) ✅ COMPLETE  
-    Module 3: Entropy Analyzer (`entropy/entropy_analyzer.py`) ✅ COMPLETE
-    Module 4: Behavioral Drift Detector (`drift/drift_detector.py`) ✅ COMPLETE
-    Testing Module: Ransomware Simulator (`testing/ransomware_simulator.py`) ✅ COMPLETE
+    Filesystem
+        │
+        ▼
+    [1] FileWatcher  ───────► event_stream.jsonl
+        │
+        ▼
+    [2] FeatureExtractor  ──► feature_stream.jsonl
+        │
+        ├────────────────────────────┬────────────────────┐
+        ▼                            ▼                    ▼
+    [3] EntropyAnalyzer        [4] DriftDetector    [5] IsolationForest
+        │                            │                    │
+        ▼                            ▼                    ▼
+    entropy_alerts.jsonl      drift_stream.jsonl   iforest_stream.jsonl
+        │                            │                    │
+        └────────────┬───────────────┴────────────────────┘
+                     ▼
+            [6] RiskScorer  ──────► risk_stream.jsonl
+                     │
+       ┌─────────────┼──────────────────┬──────────────┐
+       ▼             ▼                  ▼              ▼
+    [7] Decision   [8] Blockchain   [9] DB Sink   [11] Dashboard
+        Agent          Logger        (SQLite)        (Flask)
+       (FSM)
+       │ │ │
+       │ │ └► incidents.jsonl
+       │ └──► icacls / VSS / process suspend (real OS actions)
+       └────► sandbox lock / unlock
 
-Data flows sequentially: File Events -> Time-Slotted Windows -> Feature Vectors
--> Drift Detection. Entropy Analysis runs asynchronously on file modification
-events triggered by the monitor.
+    [10] Re-verifier (post-attack audit, on-demand or auto-triggered)
+
+The pipeline is decoupled by JSONL streams. Each module can run standalone
+(see CLI entry points) or together via `main.py` as coordinated daemon threads.
 
 ================================================================================
 2. MODULE IMPLEMENTATION DETAILS
 ================================================================================
 
 --------------------------------------------------------------------------------
-MODULE 1: FILE MONITORING (monitoring/file_watcher.py)
+MODULE 1: FILE MONITORING  (monitoring/file_watcher.py)
 --------------------------------------------------------------------------------
-Architecture: Event-Driven Wrapper over `watchdog`
-Purpose: To monitor specified directories (e.g., Desktop, Documents, Downloads,
-         Pictures) for low-level filesystem events in real-time.
+Architecture: Event-driven wrapper over `watchdog`
+Purpose:      Capture create / modify / delete / rename events on the user's
+              real Desktop, Documents, Downloads, Pictures folders, plus the
+              dedicated sandbox.
 
-Implementation Mechanics:
-- Library Used: `watchdog.observers.Observer`
-- Event Handlers: Overrides `FileSystemEventHandler` to capture `on_created`,
-  `on_modified`, `on_deleted`, and `on_moved` methods.
-- Threading: Runs continuously in a background threading loop.
-- Extensibility: Implements a callback architecture (`add_event_callback`).
-  Higher-level modules (like Module 2 and Module 3) register their callback
-  functions here to receive structured event dictionaries exactly as they occur.
+Implementation:
+- `watchdog.observers.Observer` schedules a single `_EventHandler` against
+  every monitored directory (recursive=True).
+- Each event is normalized into a structured dict and emitted to
+  in-process callbacks AND appended as one line to `event_stream.jsonl`.
+- Process attribution returns ("unknown", -1) immediately; the previous
+  per-event `psutil.process_iter(["open_files"])` scan was hundreds of
+  milliseconds per event on Windows and overflowed watchdog's
+  ReadDirectoryChangesW buffer under bursty load. Accurate attribution
+  needs OS audit logs (ETW / fanotify) which is out of scope.
+- Filtering: substring/extension/component filters discard noise from
+  `.git`, `__pycache__`, `AppData`, Office `~$` temp files, the project's
+  own JSONL streams, the SQLite DB file, and a dozen other patterns.
+- `get_default_monitored_paths()` returns the existing standard user
+  directories ransomware targets. The orchestrator additionally adds an
+  explicit watch on `~/Documents/ransomware_test/` for reliability —
+  watchdog's recursive walk can drop events on deeply nested newly created
+  subdirectories under load.
 
-Output Event Structure (JSON-like dictionary):
+Output event:
 {
-  "timestamp": "2026-03-12T16:20:00.000000+00:00",
-  "event_type": "modified",
-  "file_path": "C:\\...",
-  "file_size": 1024,
-  "process_name": "python.exe" (mocked/extracted)
+  "timestamp": "2026-04-29T10:39:00.818039+00:00",
+  "event_type": "renamed",
+  "file_path": "C:\\Users\\...\\doc_xyz.jpg",
+  "file_size": 4838,
+  "process_id": -1,
+  "process_name": "unknown",
+  "dest_path": "C:\\Users\\...\\doc_xyz.jpg.locked"
 }
 
 --------------------------------------------------------------------------------
-MODULE 2: FEATURE EXTRACTION (features/feature_extractor.py)
+MODULE 2: FEATURE EXTRACTION  (features/feature_extractor.py)
 --------------------------------------------------------------------------------
-Architecture: Time-Driven Sliding Window Aggregator
-Purpose: To transform raw, high-frequency file events into normalized, fixed-time
-         statistical feature vectors.
+Architecture: Time-driven sliding-window aggregator
+Purpose:      Aggregate raw events into per-window behavioral feature vectors.
 
-Implementation Mechanics:
-- Synchronization: Uses `threading.Lock()` to ensure thread-safe ingestion of
-  events coming asynchronously from Module 1.
-- Time-Driven Logic: Uses a background daemon thread (`_timer_loop`) that sleeps
-  for `N` seconds (e.g., 10s or 20s). When it wakes, it forces the current window
-  to close and emit its aggregated data, regardless of whether any events occurred.
-- Aggregation: Uses `collections.Counter` and `collections.defaultdict` to track:
-  - Total files created, deleted, modified, renamed.
-  - Number of unique directories and file extensions touched.
-  - Write rates (total events / window duration).
-  - Minimum, maximum, and average file sizes.
-- Orchestration: Writes every completed feature vector as a line of JSON into an
-  append-only stream file: `feature_stream.jsonl` in the project root.
+Implementation:
+- Background daemon thread closes a 5-second window on each tick (was 10s
+  originally; shortened for faster dashboard feedback).
+- Thread-safe ingestion via `threading.Lock()`.
+- Empty windows still emit a zero-activity vector so detectors see a
+  regular heartbeat.
+- Per-window output written to `feature_stream.jsonl`.
 
-Mathematical Formulas:
-- Write Rate: R = total_events / window_duration
-- Average File Size: μ_size = Σ(file_sizes) / total_files
-- File Size Variance: σ²_size = (1/n) * Σ(file_sizeᵢ - μ_size)²
-- Unique Process Ratio: UPR = unique_processes / total_events
-- Directory Diversity Index: DDI = unique_directories / total_events
-- Extension Entropy: H_ext = -Σ p(ext) · log₂(p(ext))
-  where p(ext) = frequency(ext) / total_files
+Mathematical formulas:
+- Write rate           : R = total_events / window_duration
+- Average file size    : μ = Σ(file_sizes) / N
+- File-size variance   : σ² = (1/N) · Σ(sizeᵢ − μ)²
+- Unique-process ratio : UPR = unique_processes / total_events
+- Directory diversity  : DDI = unique_directories / total_events
+- Extension entropy    : H_ext = −Σ p(ext) · log₂(p(ext))
 
-Integration:
-Module 2 instantiates Module 1 directly, wiring its internal `add_event` method
-as a callback to the FileWatcher.
+Computed feature vector (one per 5-second window):
+{
+  "window_start", "window_end",
+  "files_created", "files_modified", "files_deleted", "rename_count",
+  "total_file_events", "write_rate",
+  "unique_file_types", "directories_touched",
+  "unique_process_count", "files_touched_per_process",
+  "average_file_size", "max_file_size", "min_file_size"
+}
 
 --------------------------------------------------------------------------------
-MODULE 3: ENTROPY ANALYZER (entropy/entropy_analyzer.py)
+MODULE 3: ENTROPY ANALYZER  (entropy/entropy_analyzer.py)
 --------------------------------------------------------------------------------
-Architecture: Asynchronous Mathematical Analyzer
-Purpose: To detect the presence of encrypted files by analyzing data randomness
-         (Shannon Entropy). Ransomware heavily encrypts files, pushing their
-         entropy close to the theoretical maximum (8.0 bits per byte).
+Architecture: Synchronous Shannon-entropy scorer triggered on file events
+Purpose:      Detect cipher-quality randomness in file content, the canonical
+              fingerprint of encryption.
 
-Implementation Mechanics:
-- Math Engine: Reads file chunks (to handle large files without memory bloat) and
-  computes the byte frequency distribution. Uses the standard Shannon entropy
-  formula: `H = -sum(P(x) * log2(P(x)))`
-- Thresholding: Triggers a high-entropy alert if the calculated value exceeds a
-  configurable threshold (e.g., 7.5 bits/byte).
-- Resilience: Implements `FileNotFoundError` and `PermissionError` handling to
-  survive rapid rename/delete sequences typical of ransomware (e.g., where a file
-  is encrypted, renamed to `.locked`, and the original is deleted before the
-  entropy analyzer can open it).
+Implementation:
+- Reads file in 1 MB chunks, counts byte frequencies, computes
+  H = −Σ p(x) · log₂ p(x), range 0–8 bits/byte.
+- Threshold: 7.2 bits/byte. Tuned to flag genuine AES/ChaCha20 ciphertext
+  (~7.99) without false-flagging compressed media (~7.0–7.8).
+- Naturally-high-entropy whitelist: PNG, JPG, MP3, MP4, ZIP, 7z, RAR,
+  DOCX, XLSX, PPTX, PDF — analysis is skipped for files with these
+  extensions UNLESS the file also carries a ransomware suffix (`.locked`,
+  `.crypto`, `.enc`, `.encrypted`, …). This eliminates false positives
+  from screenshots and Office documents.
+- Resilient to rapid rename/delete: when the original path no longer
+  exists, falls back to the corresponding `<path>.locked` candidate.
+- Each handled event appends a record to `entropy_alerts.jsonl` with
+  `alert: "HIGH_ENTROPY"` or `"NORMAL"`.
 
-Mathematical Formulas:
-- Shannon Entropy: H(X) = -Σ p(x) · log₂(p(x))
-  where p(x) is the probability of each byte value (0-255)
-- Byte Probability: p(x) = count(x) / total_bytes
-- Entropy Range: 0 ≤ H ≤ 8 bits per byte
-  * Plain text: ~3.0-5.0 bits
-  * Compressed: ~7.0-7.8 bits  
-  * Encrypted: ~7.9-8.0 bits
-
-Integration:
-Module 2 optionally instantiates Module 3. If present, every `modified` and
-`renamed` event is passed to the EntropyAnalyzer for near-instant cryptographic
-validation.
+Mathematical formulas:
+- Shannon entropy : H(X) = −Σ p(x) · log₂ p(x), x ∈ {0..255}
+- Byte probability: p(x) = count(x) / total_bytes
+- Reference bands : plain text 3.0–5.0, compressed 7.0–7.8, encrypted 7.9–8.0
 
 --------------------------------------------------------------------------------
-MODULE 4: BEHAVIORAL DRIFT DETECTOR (drift/drift_detector.py)
+MODULE 4: BEHAVIORAL DRIFT DETECTOR  (drift/drift_detector.py)
 --------------------------------------------------------------------------------
-Architecture: Standalone Streaming Anomaly Detector
-Purpose: To analyze the sequence of feature vectors (emitted by Module 2) and
-         detect abrupt or creeping shifts in baseline system behavior.
+Architecture: Three-algorithm streaming anomaly detector
+Purpose:      Flag windows whose feature vector deviates from recent baseline.
 
-Implementation Mechanics:
-File Tailing: Operates independently by continuously tailing `feature_stream.jsonl`.
-It uses a robust string-buffer loop to read incomplete JSON writes seamlessly across
-concurrent file accesses.
+Three detectors run in parallel; the more that agree, the higher the severity.
 
-Detection Algorithms:
-1. Z-Score (Statistical Spike Detection):
-   Maintains a rolling history (`collections.deque`) of the last 30 windows.
-   Calculates `mean` and `stdev`. If the incoming feature deviates by `|Z| > 3`,
-   an alert is generated. Ideal for massive, sudden ransomware bursts.
+(a) Z-Score (sudden statistical spike)
+    - Rolling history of last 30 windows per feature (`collections.deque`).
+    - Fires when |z| > 3.0  (0.3 % false-positive rate, tightened from 2.0
+      to suppress noise on idle baselines).
+    - Requires 10 baseline windows before activating (raised from 3; stdev
+      of 3 points is statistically meaningless).
+    - Z = (x − μ) / σ ; μ, σ from rolling history.
 
-   Mathematical Formulas:
-   - Z-Score: Z = (x - μ) / σ
-     where x = current value, μ = rolling mean, σ = rolling std deviation
-   - Rolling Mean: μ = (1/n) * Σ(xᵢ)
-   - Rolling Std Dev: σ = √[(1/n) * Σ(xᵢ - μ)²]
-   - Detection Threshold: |Z| > 3.0
+(b) ADWIN (adaptive windowing)
+    - From `river.drift.ADWIN`. No assumptions about distribution.
+    - Auto-expands its window until detecting a distributional change,
+      then drops the older sub-window.
 
-2. ADWIN (Adaptive Windowing):
-   Uses the `river` library's `ADWIN` class. A sophisticated streaming algorithm
-   that automatically adjusts its internal history window and detects conceptual
-   distribution shifts without assuming normal data distributions.
+(c) Page-Hinkley (cumulative-sum CUSUM)
+    - Sₙ = Σ(xᵢ − δ − μ̄), tracking cumulative deviation above minimum.
+    - Fires when PHₙ = Sₙ − min(S₁..Sₙ) > λ (λ = 50.0).
+    - Catches "low and slow" gradual drift.
 
-   Mathematical Formulas:
-   - H₀ (Null Hypothesis): Two windows have same expected value
-   - Test Statistic: |μ₁ - μ₂| > ε
-     where ε = √[(1/n₁ + 1/n₂) * ln(2/δ)]
-   - Confidence Bound: δ = confidence parameter (typically 0.002)
-   - Window Split: When H₀ is rejected, older window is dropped
+Idle-window suppression: when ALL monitored features are exactly zero in
+a window, all three detector flags are forced off. Page-Hinkley CUSUM
+otherwise drifts on long zero-streams and produces spurious LOW alerts.
 
-3. Page-Hinkley (Cumulative Sum Test):
-   A custom-built CUSUM implementation. Tracks the cumulative running sum of minute
-   deviations above the historical minimum. If the accumulated error exceeds a
-   threshold (e.g., 50.0), it trips. Ideal for "low and slow" ransomware evasions.
-
-   Mathematical Formulas:
-   - Cumulative Sum: Sₙ = Σ(xᵢ - δ - μ̄)
-     where δ = minimum acceptable magnitude, μ̄ = running average
-   - Minimum Cumulative Sum: mₙ = min(S₁, S₂, ..., Sₙ)
-   - Page-Hinkley Statistic: PHₙ = Sₙ - mₙ
-   - Detection Threshold: PHₙ > λ (typically λ = 50.0)
-
-Severity Scoring:
-- 1 detector triggered  => LOW severity
-- 2 detectors triggered => MEDIUM severity
-- 3 detectors triggered => HIGH severity
-
-Outputs:
-Alerts are printed with red/yellow visual markers directly to the terminal when
-drift is confirmed.
+Severity ladder: 1 detector = LOW, 2 = MEDIUM, 3 = HIGH.
+Each window's result is written to `drift_stream.jsonl`. When drift is
+detected, a row is also inserted into the SQLite `drift_alerts` table.
 
 --------------------------------------------------------------------------------
-MODULE 5: TESTING SIMULATOR (testing/ransomware_simulator.py)
+MODULE 5: ISOLATION FOREST ANOMALY DETECTOR
+          (anomaly_detection/isolation_forest.py)
 --------------------------------------------------------------------------------
-Architecture: Safe Sandbox File Generator
-Purpose: To generate controlled file-system activity for end-to-end testing of the
-         complete detection pipeline without risking actual system data.
+Architecture: scikit-learn IsolationForest, online-trained in-place
+Purpose:      ML detection of feature-vector anomalies the rule-based
+              detectors miss (unusual *combinations* of features).
 
-Implementation Mechanics:
-- Sandboxed Execution: All activity confined to `~/Documents/ransomware_test/`
-- Multiple Attack Modes:
-  * Normal: Slow, low-volume activity (baseline behavior)
-  * Bulk: High-volume creates and edits (no malicious renames)
-  * Ransomware: Base64-encode files → rename to .locked → delete original
-- File Generation: Creates realistic test files with various extensions
-  (.txt, .docx, .pdf, .xlsx, .jpg, .png, .csv)
-- Safety Features: Automatic cleanup option, never touches files outside sandbox
+Implementation:
+- `sklearn.ensemble.IsolationForest`, n_estimators=200, contamination=0.05,
+  random_state=42.
+- Trained on the first 50 windows collected from `feature_stream.jsonl`.
+  Once trained, the model is persisted to `isolation_forest.pkl` and
+  reused across sessions.
+- For each new window post-training, the detector emits
+  `{anomaly: bool, anomaly_score: float, confidence: float}` to
+  `iforest_stream.jsonl`.
+- Confidence = sigmoid(raw_score · 5.0), bounded [0,1].
+- Feature vector used for inference:
+  [write_rate, files_modified, rename_count,
+   files_touched_per_process, directories_touched]
 
-Integration:
-Standalone testing tool that can be run while detection modules are active to
-validate the entire pipeline from file events through drift detection.
+--------------------------------------------------------------------------------
+MODULE 6: RISK SCORING ENGINE  (risk_engine/risk_scorer.py)
+--------------------------------------------------------------------------------
+Architecture: Multi-stream tail + weighted fusion
+Purpose:      Combine all detector signals into a single 0–100 risk score.
+
+Implementation:
+- Tails four streams in parallel: `feature_stream` (drives the cadence)
+  plus state-update streams `entropy_alerts`, `drift_stream`,
+  `iforest_stream`.
+- On every tick of the loop, drains ALL pending lines from each
+  state-update stream (not one per iteration). This is the difference
+  between entropy_flag arriving in time vs. lagging by 30+ seconds
+  during a burst.
+- Score formula (sums to 100 max):
+
+      score = 25 · entropy_flag
+            + 20 · min(write_rate / 20, 1)
+            + 20 · min(rename_count / 30, 1)
+            + 20 · drift_value   // NONE 0, LOW 0.3, MED 0.6, HIGH 1.0
+            + 15 · iforest_confidence
+
+- Levels:
+      < 30   NORMAL
+      30–59  SUSPICIOUS
+      60–79  HIGH_RISK
+      ≥ 80   CRITICAL
+
+- Entropy flag has a 60-second TTL — a single high-entropy file shouldn't
+  pin the score forever after the burst ends.
+- Each window's result appended to `risk_stream.jsonl` and inserted into
+  SQLite `risk_scores`.
+
+--------------------------------------------------------------------------------
+MODULE 7: DECISION AGENT (FSM)  (agent/decision_agent.py)
+--------------------------------------------------------------------------------
+Architecture: Risk-driven finite-state machine
+Purpose:      Drive automated defensive response to sustained risk signals.
+
+States and transitions:
+
+    MONITORING ──first HIGH_RISK/CRITICAL──► ALERT
+         ▲              │
+         │              │ 2 consecutive HIGH windows
+         │              ▼
+    MONITORING ◄──5 quiet wins── RECOVERING ◄──3 below 30── RESPONDING
+                                       ▲                       │
+                                       │ risk rises again      │
+                                       └───────────────────────┘
+    NEW: ALERT ──3 consecutive below-30 windows──► MONITORING
+         (decay path so a one-off spike doesn't pin the agent in ALERT)
+
+Side effects per transition:
+
+  • MONITORING → ALERT      Log + take Volume Shadow Copy snapshot of C:\
+  • ALERT → RESPONDING      Lock sandbox via `icacls /deny Everyone:(W,D,DC) /T`
+                            + suspend tracked suspicious processes
+  • RESPONDING → RECOVERING Unlock sandbox via `icacls /remove:d Everyone /T`
+                            + resume suspended processes
+
+Critical safety constraint: `monitored_paths` passed to the agent is
+RESTRICTED TO THE SANDBOX in `main.py`, never the real user folders.
+Locking real Desktop/Documents/Downloads/Pictures with icacls would render
+them inaccessible from File Explorer until manually unlocked. The watcher
+still observes those folders for detection, but defensive responses are
+confined to `~/Documents/ransomware_test/`.
+
+Process attribution is fed via a `process_names_getter` callback that
+returns the set of non-Python process names the watcher has recently seen
+modify files. On Windows without admin this set is usually empty (`unknown`
+attribution), and the agent logs a warning rather than killing the wrong
+process.
+
+Every state transition is appended as a JSON line to `incidents.jsonl`.
+
+--------------------------------------------------------------------------------
+MODULE 8: BLOCKCHAIN EVIDENCE LOGGER  (blockchain/evidence_logger.py)
+--------------------------------------------------------------------------------
+Architecture: Local SHA-256 Merkle-style append-only chain
+Purpose:      Tamper-evident forensic ledger of all confirmed alerts.
+
+Block schema:
+{
+  "index", "timestamp",
+  "alert_type", "severity",
+  "payload",
+  "payload_hash"  : sha256(payload, sort_keys),
+  "prev_hash"     : sha256 of previous block,
+  "block_hash"    : sha256(everything-above)
+}
+
+- Tip cache: on init, only the last line of `evidence_chain.jsonl` is
+  read to seed the in-memory `_last_hash` and `_next_index`. Each
+  `add_alert()` is then O(1). The previous implementation re-read the
+  whole chain per append, an O(n) cost that worsened linearly.
+- `verify_chain()` walks the file, recomputes payload_hash, prev_hash,
+  and block_hash for each block, raising `ChainTamperError` on mismatch.
+- Subscribes to `risk_stream.jsonl`; appends a block for every
+  SUSPICIOUS / HIGH_RISK / CRITICAL window. The ledger is preserved
+  across sessions (NOT cleared on `Reset Session`) — it's the immutable
+  forensic record.
+
+--------------------------------------------------------------------------------
+MODULE 9: DATABASE PERSISTENCE  (database/db_manager.py)
+--------------------------------------------------------------------------------
+Architecture: Thread-safe SQLite manager
+Purpose:      Persistent storage for the dashboard's history queries.
+
+Tables:
+- file_events     (id, timestamp, event_type, file_path, file_size, process_name)
+- drift_alerts    (id, timestamp, severity, top_feature, top_z_score,
+                   write_rate, rename_count, detectors_fired)
+- risk_scores     (id, timestamp, score, level, entropy_flag, triggered_response)
+- entropy_alerts  (id, timestamp, file_path, entropy, threshold)
+
+- Single connection (`check_same_thread=False`) guarded by `threading.Lock`.
+- `prune_table(table, max_records=10_000)` keeps each table bounded so
+  disk doesn't grow unbounded on a busy machine.
+- `DbPrunerThread` in main.py runs `prune_table` every 10 minutes.
+- `prune_table(.., 0)` clears a table entirely; used by `Reset Session`.
+
+--------------------------------------------------------------------------------
+MODULE 10: RE-VERIFICATION AUDIT  (verification/reverifier.py)
+--------------------------------------------------------------------------------
+Architecture: Post-attack forensic auditor
+Purpose:      After an attack ends, walk the sandbox and identify which
+              `.locked` files the detection pipeline actually caught vs.
+              which ones slipped through, with explicit per-detector
+              reasons for any miss.
+
+Algorithm:
+1. List all `*.locked` files in the sandbox.
+2. For each file, look up:
+   - Entropy: any record in `entropy_alerts.jsonl` with this file's path
+     and `alert: "HIGH_ENTROPY"` → entropy CAUGHT.
+   - Drift: any drift record with severity ∈ {MEDIUM, HIGH} within ±15s
+     of the file's mtime → drift CAUGHT.
+     (LOW drift is excluded — it fires routinely on background noise
+     and would falsely "catch" any nearby decoy file.)
+   - IF: any iforest record with `anomaly: True` within ±15s of the
+     file's mtime → IF CAUGHT.
+3. If any of the three caught it, mark caught. Otherwise, mark MISSED
+   and produce a list of specific reasons:
+   - "entropy: 3.4 bits/byte was below threshold 7.2 — file content
+      was not random enough to flag"
+   - "entropy: skipped (naturally_high_entropy_extension) — extension
+      is on the whitelist"
+   - "entropy: no alert recorded — file may have been renamed/deleted
+      before the analyzer could read it"
+   - "drift: detectors fired Nx this session but none within ±15s of
+      this file"
+   - "drift: no detector fired during this session — activity volume
+      may have been below the burst threshold"
+   - "iforest: no anomaly flagged — model may still be in training
+      phase (needs 50 samples)"
+
+Reports are appended to `reverification_report.jsonl`. The dashboard's
+`/api/reverification` endpoint serves the latest entry.
+
+The audit auto-runs in `_run_simulation`'s `finally` block before any
+sandbox cleanup, so it always sees the final post-attack state.
+
+--------------------------------------------------------------------------------
+MODULE 11: WEB DASHBOARD  (dashboard/app.py + dashboard/index.html)
+--------------------------------------------------------------------------------
+Architecture: Flask backend + single-page HTML/JS frontend (no build step)
+Purpose:      Live visualization and operator control surface.
+
+Backend (Flask) endpoints:
+
+  GET  /                       → serves index.html
+  GET  /api/status             → current risk/level/agent_state, recent
+                                 drift alerts, risk score history,
+                                 chain validity (cached 30s),
+                                 simulator state, pipeline counters
+                                 (file_events, risk_scores, entropy_alerts,
+                                 iforest_trained)
+  POST /api/simulate           → kick off normal/bulk/ransomware simulation
+  POST /api/stop_simulation    → cooperatively stop a running sim and
+                                 cleanup the sandbox
+  GET  /api/reverification     → latest audit report (last line of JSONL)
+  POST /api/reverify_now       → run an audit on demand
+  POST /api/inject_decoy_missed→ drop a low-entropy `.locked` file into
+                                 the sandbox so the audit reports a
+                                 concrete missed-detection case (handles
+                                 the icacls deny lock automatically by
+                                 retrying after `/remove:d Everyone /T`)
+  POST /api/reset_session      → clear DB tables, JSONL streams,
+                                 simulator state. Preserves blockchain
+                                 ledger and trained ML model.
+
+Frontend cards:
+- Current Risk      — color-coded gauge (green/amber/orange/red)
+- Agent and Integrity — state badge + risk-history chart + chain-valid dot
+- Detection Pipeline — KPI grid: file events, risk scores, entropy alerts,
+                       ML model status (Training… → ✓ Trained)
+- Live Simulation   — Mode/File Count/Duration controls,
+                       Start / Stop & Cleanup buttons, status row that
+                       turns GREEN ("🛡 Defense activated") instead of
+                       red error when the agent's icacls lock blocks
+                       the simulator's next encryption attempt
+- Recent Drift Alerts table — color-coded severity pills,
+                              local-time timestamps
+- Re-verification Report  — total/caught/missed counts, coverage %,
+                            detector-hit summary, per-missed-file
+                            reasons, "Inject Decoy" + "Run Now" buttons
+
+UX:
+- Polls /api/status every 5 s and /api/reverification every 7 s
+- Pulse animation on counter changes
+- Subtle card hover lift
+- Confirm dialog on Reset Session
+- Responsive: 12-column grid on wide screens, stacks on narrow
 
 ================================================================================
-3. SYSTEM ORCHESTRATION & RUNTIME
+3. ORCHESTRATION & RUNTIME
 ================================================================================
-The system supports both multi-terminal microservice architecture and unified
-execution through individual module CLIs:
 
-OPTION A: Multi-Terminal Microservice Architecture
---------------------------------------------------
-TERMINAL A (Data Generation & Extraction)
-Command: `python features/feature_extractor.py --mode realtime --window 10`
-Role: Starts the watchdog process, aggregates features every 10 seconds, runs
-entropy analysis on files in the background, and dumps vectors to `feature_stream.jsonl`.
+Single-command launch:
 
-TERMINAL B (Behavioral Analytics)
-Command: `python drift/drift_detector.py --mode realtime`
-Role: Silently tails `feature_stream.jsonl`. When a vector drops in, it runs
-Z-score, ADWIN, and Page-Hinkley to ensure behavior is normal.
+    python main.py
+                                  (optional flags)
+    python main.py --simulate ransomware --sim-count 50
 
-TERMINAL C (Testing / Attacking)
-Command: `python testing/ransomware_simulator.py --mode ransomware --count 40`
-Role: Synthetically creates safe dummy files and mimics rapid encryption, enabling
-both the Entropy Analyzer and Drift Detector to trigger without relying on live
-malware.
+`main.py` spawns the following daemon threads inside one process:
 
-OPTION B: Individual Module Testing
-----------------------------------
-- File Monitoring: Integrated into feature extractor
-- Feature Extraction: `python features/feature_extractor.py --mode simulation`
-- Entropy Analysis: `python entropy/entropy_analyzer.py [file_path]`
-- Drift Detection: `python drift/drift_detector.py --mode demo`
-- Testing: `python testing/ransomware_simulator.py --mode [normal|bulk|ransomware]`
+  Thread                              Purpose
+  -----------------------------------------------------------------------------
+  FileWatcherFeatureEntropyThread     Module 1 + Module 2 + Module 3 callback
+  DriftDetectorThread                 Module 4
+  IsolationForestThread               Module 5 (online training + detection)
+  RiskScorerThread                    Module 6
+  DecisionAgentThread                 Module 7
+  EvidenceLoggerThread                Module 8
+  RiskDbSinkThread                    Module 9 (writes risk_scores from stream)
+  DashboardThread                     Module 11 (Flask on 127.0.0.1:5000)
+  DbPrunerThread                      Module 9 (every 10 min, trims to 10k rows)
+  RansomwareSimulatorThread           Optional, only when --simulate is passed
 
-================================================================================
-4. IMPLEMENTATION STATUS & NEXT STEPS
-================================================================================
-COMPLETED MODULES (✅):
-- File Monitoring: Full watchdog-based real-time monitoring with event filtering
-- Feature Extraction: Sliding window aggregation with configurable time windows
-- Entropy Analysis: Shannon entropy calculation with configurable thresholds
-- Drift Detection: Three-algorithm approach (Z-Score, ADWIN, Page-Hinkley)
-- Testing Simulator: Safe sandboxed ransomware simulation
+Session reset at startup:
+- All JSONL streams (event/feature/entropy/risk/drift/iforest/incidents/
+  reverification_report) are truncated.
+- All operational SQLite tables cleared.
+- Baseline `risk_score(0, NORMAL)` row inserted.
+- A "MONITORING" line appended to `incidents.jsonl` so the dashboard's
+  agent badge reads MONITORING immediately.
+- PRESERVED across sessions: `evidence_chain.jsonl` (blockchain ledger),
+  `isolation_forest.pkl` (trained ML model).
 
-EMPTY DIRECTORIES (🚧):
-- blockchain/ : For evidence logging implementation
-- risk_engine/ : For risk scoring and aggregation
-- dashboard/ : For monitoring interface
-- database/ : For persistent storage
-- agent/ : For agentic decision system
-- anomaly_detection/ : For ML-based anomaly detection
+Standalone module CLIs (each module can run independently for testing):
 
-DEPENDENCIES:
-Current requirements.txt includes minimal dependencies (watchdog, psutil).
-Additional libraries needed for full functionality:
-- river: For ADWIN drift detection
-- numpy/pandas: For data processing
-- scikit-learn: For ML algorithms
-- web3: For blockchain integration
+  python monitoring/file_watcher.py
+  python features/feature_extractor.py --mode realtime --window 5
+  python entropy/entropy_analyzer.py [path]
+  python drift/drift_detector.py --mode demo
+  python anomaly_detection/isolation_forest.py --mode demo
+  python risk_engine/risk_scorer.py --mode demo
+  python agent/decision_agent.py --mode demo
+  python blockchain/evidence_logger.py --demo
+  python verification/reverifier.py
+  python testing/ransomware_simulator.py --mode ransomware --count 50
+  python testing/ransomware_simulator.py --cleanup
 
 ================================================================================
-5. FUTURE EXPANSION ROADMAP
+4. SAFETY & DEFENSIVE-ACTION SCOPE
 ================================================================================
-Phase 1 - Core Enhancements:
-- Implement unified main.py orchestration
-- Add risk scoring engine with weighted threat assessment
-- Create agentic decision system for automated response
 
-Phase 2 - Evidence & Monitoring:
-- Blockchain evidence logging for forensic integrity
-- Real-time monitoring dashboard with alert visualization
-- Database integration for historical analysis
+The DecisionAgent's RESPONDING state takes real OS-level actions. To prevent
+accidental lockout of user data:
 
-Phase 3 - Advanced Detection:
-- Machine learning-based anomaly detection
-- Federated learning across multiple endpoints
-- Graph-based process behavior modeling
+- `monitored_paths` for the agent is set to `[sandbox_dir]` ONLY in main.py,
+  never the real user folders. icacls deny applies only to the sandbox.
+- Sandbox = `~/Documents/ransomware_test/`, created if absent.
+- VSS snapshot is taken with `wmic shadowcopy call create Volume='C:\'`.
+  This creates a system-level shadow copy; failure is logged but does not
+  block the FSM transition.
+- Process suspension uses `psutil.Process(pid).suspend()`. If the
+  `process_names_getter` returns an empty set (typical on Windows without
+  admin), the agent logs a warning and skips suspension.
+- The Inject Decoy endpoint, if its first write fails with PermissionError,
+  retries once after `icacls /remove:d Everyone /T` to recover from a
+  lingering deny ACE.
 
-The current modular architecture is specifically designed to support seamless
-integration of these future components. As Module 3 (Entropy) and Module 4 (Drift)
-flag anomalous conditions, those high-confidence JSON alert payloads can be cleanly
-hooked into downstream modules for risk scoring, blockchain logging, and automated
-response actions.
+If the agent's lock blocks the simulator mid-burst, the resulting
+PermissionError is reframed in the dashboard as "🛡 Defense activated
+mid-attack" (green) rather than "Last run error" (red), because that's
+exactly the system's intended behavior.
+
+================================================================================
+5. CONFIGURATION SUMMARY
+================================================================================
+
+Tunable constants and their current values:
+
+  monitoring/file_watcher.py
+    IGNORED_DIRECTORIES, IGNORED_EXTENSIONS,
+    IGNORE_FILES (project's own JSONL/DB files self-loop guard)
+
+  features/feature_extractor.py
+    window_seconds = 5
+
+  entropy/entropy_analyzer.py
+    DEFAULT_THRESHOLD = 7.2
+    NATURALLY_HIGH_ENTROPY_EXTENSIONS = {.png, .jpg, .mp3, .zip, .docx, ...}
+    SUSPICIOUS_SUFFIXES = {.locked, .crypto, .enc, ...}
+
+  drift/drift_detector.py
+    Z_THRESHOLD = 3.0
+    MIN_BASELINE_WINDOWS = 10
+    HISTORY_SIZE = 30
+    PH_THRESHOLD = 50.0
+
+  anomaly_detection/isolation_forest.py
+    min_samples = 50
+    contamination = 0.05
+    n_estimators = 200
+
+  risk_engine/risk_scorer.py
+    weights = (entropy 25, write_rate 20, rename_count 20, drift 20, iforest 15)
+    entropy TTL = 60 s
+    DRIFT_MAP = {NONE 0.0, LOW 0.3, MED 0.6, HIGH 1.0}
+
+  agent/decision_agent.py
+    ALERT trigger:        first HIGH_RISK or CRITICAL
+    RESPONDING trigger:   2 consecutive HIGH windows
+    RECOVERING trigger:   3 windows below 30
+    RECOVERING → MONITORING: 5 quiet windows
+    ALERT → MONITORING (decay): 3 windows below 30  [NEW]
+
+  verification/reverifier.py
+    TEMPORAL_WINDOW_SECONDS = 15.0
+    DRIFT_CATCH_SEVERITIES = {MEDIUM, HIGH}
+
+  database/db_manager.py
+    DbPruner interval = 600 s (10 min)
+    Per-table retention = 10 000 rows
+
+================================================================================
+6. FILE LAYOUT
+================================================================================
+
+ransomware-early-warning-system/
+│
+├── main.py                              orchestrator (all threads)
+├── demo_runner.py                       legacy multi-process launcher
+├── requirements.txt
+│
+├── monitoring/      file_watcher.py     Module 1
+├── features/        feature_extractor.py Module 2
+├── entropy/         entropy_analyzer.py  Module 3
+├── drift/           drift_detector.py    Module 4
+├── anomaly_detection/ isolation_forest.py Module 5
+├── risk_engine/     risk_scorer.py       Module 6
+├── agent/           decision_agent.py    Module 7
+├── blockchain/      evidence_logger.py   Module 8
+├── database/        db_manager.py        Module 9
+├── verification/    reverifier.py        Module 10
+├── dashboard/       app.py + index.html  Module 11
+├── testing/         ransomware_simulator.py
+│
+└── (runtime artifacts, recreated each session)
+    ├── event_stream.jsonl
+    ├── feature_stream.jsonl
+    ├── entropy_alerts.jsonl
+    ├── drift_stream.jsonl
+    ├── iforest_stream.jsonl
+    ├── risk_stream.jsonl
+    ├── incidents.jsonl
+    ├── reverification_report.jsonl
+    ├── ransomware_monitor.db            SQLite (cleared at session start)
+    ├── isolation_forest.pkl             trained ML model (preserved)
+    └── evidence_chain.jsonl             blockchain ledger (preserved)
+
+================================================================================
+7. RECENT IMPROVEMENTS & FIXES
+================================================================================
+
+Detection accuracy
+- Entropy threshold raised 4.5 → 7.2 (ciphertext-only, ignores compressed media)
+- Naturally-high-entropy extension whitelist + suspicious-suffix override
+  eliminates screenshot/PDF/docx false positives without weakening
+  ransomware detection
+- Z-score threshold raised 2.0 → 3.0; baseline 3 → 10 windows
+- Drift suppressed on idle windows (all features = 0) to silence
+  Page-Hinkley CUSUM on baselines
+- Reverifier MEDIUM/HIGH-only drift criterion stops noise from
+  falsely catching files
+
+Performance
+- File watcher process attribution is now O(1) ("unknown", -1) rather
+  than O(processes) per event — restored event throughput under
+  ransomware bursts that previously dropped 95% of events
+- Risk scorer drains all pending state-update lines per loop iteration
+  rather than one — entropy_flag now reflects within ~1 second of the
+  first .locked file rather than 30+ seconds
+- Blockchain `add_alert` is O(1) via in-memory tip cache
+- Dashboard chain-validity check cached for 30 s
+- DB pruner thread keeps each table ≤ 10 000 rows
+
+Correctness
+- Reverifier uses per-file mtime ±15s correlation rather than
+  session-wide flags
+- DecisionAgent monitored_paths restricted to sandbox (cannot lock
+  real user folders)
+- ALERT → MONITORING decay path so a single spike doesn't pin agent
+- PermissionError on sandbox path correctly reclassified as defense
+  success (uses `exc.filename`, not `str(exc)`, to bypass Windows
+  backslash-escaping in the str repr)
+- Inject Decoy auto-recovers from lingering icacls deny ACE
+- Ransomware simulator uses `os.urandom` (~7.99 entropy) instead of
+  base64 (~6.0) — actually triggers entropy detection
+- Hardcoded developer paths removed from feature_extractor and
+  ransomware_simulator (now use Path.home())
+- Project's own JSONL/DB files added to FileWatcher's IGNORE_FILES
+  set — no more self-loop events polluting feature windows
+
+UX
+- Centered card layout with hover lift and pulse animations
+- Color-coded severity pills (LOW/MED/HIGH) and agent state badges
+- Local-time timestamps everywhere (was UTC)
+- Reset Session button (preserves model + ledger, clears everything else)
+- Defense-success message in green replaces scary red error text
+- Inject Decoy button for on-demand missed-file demonstration
+- Empty-state placeholders in tables
+
+================================================================================
+END
+================================================================================

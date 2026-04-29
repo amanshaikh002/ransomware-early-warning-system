@@ -56,6 +56,19 @@ class Reverifier:
             project_root / "reverification_report.jsonl"
         )
 
+    # When correlating a file's mtime against drift/iforest streams,
+    # how wide a window (seconds either side) counts as "around the same
+    # time as the file appeared". Three feature windows wide.
+    TEMPORAL_WINDOW_SECONDS: float = 15.0
+
+    # Drift severities considered strong enough to count as catching a
+    # file. LOW drift fires routinely from background noise (Page-Hinkley
+    # CUSUM on near-idle baselines, single-file activity from unrelated
+    # apps), so it would falsely "catch" any nearby decoy or unrelated
+    # locked file. MEDIUM/HIGH require at least 2 detectors to agree,
+    # which corresponds to a real burst.
+    DRIFT_CATCH_SEVERITIES: set[str] = {"MEDIUM", "HIGH"}
+
     @staticmethod
     def _load_jsonl(path: Path) -> list[dict]:
         if not path.exists():
@@ -71,6 +84,15 @@ class Reverifier:
                 except json.JSONDecodeError:
                     continue
         return records
+
+    @staticmethod
+    def _parse_iso(ts: str) -> datetime | None:
+        if not ts:
+            return None
+        try:
+            return datetime.fromisoformat(ts.replace("Z", "+00:00"))
+        except (ValueError, TypeError):
+            return None
 
     def _list_locked_files(self) -> list[Path]:
         if not self.sandbox_dir.is_dir():
@@ -90,9 +112,11 @@ class Reverifier:
             if fp:
                 entropy_by_path[fp.lower()] = record
 
+        # Only count MEDIUM/HIGH drift as "the system fired" for the
+        # purposes of catching files. LOW drift on baselines is noise.
         drift_fired_count = sum(
             1 for r in drift_records
-            if str(r.get("severity", "")).upper() not in {"", "NONE"}
+            if str(r.get("severity", "")).upper() in self.DRIFT_CATCH_SEVERITIES
         )
         iforest_fired_count = sum(1 for r in iforest_records if r.get("anomaly"))
         entropy_high_count = sum(
@@ -100,6 +124,22 @@ class Reverifier:
             if str(r.get("alert", "")).upper() == "HIGH_ENTROPY"
         )
 
+        # Pre-parse drift / iforest timestamps once so the per-file loop
+        # below is O(files * detector_records) instead of repeatedly
+        # re-parsing the same strings.
+        drift_dt_records: list[tuple[datetime, dict]] = []
+        for r in drift_records:
+            dt = self._parse_iso(str(r.get("timestamp", "")))
+            if dt is not None:
+                drift_dt_records.append((dt, r))
+
+        iforest_dt_records: list[tuple[datetime, dict]] = []
+        for r in iforest_records:
+            dt = self._parse_iso(str(r.get("timestamp", "")))
+            if dt is not None:
+                iforest_dt_records.append((dt, r))
+
+        window = self.TEMPORAL_WINDOW_SECONDS
         caught: list[dict] = []
         missed: list[dict] = []
 
@@ -117,11 +157,29 @@ class Reverifier:
             )
             entropy_error = entropy_record.get("error") if entropy_record else None
 
-            # Per-file timestamp correlation is fragile (.locked file mtime can
-            # shift after rename). We use session-wide proxies: did drift fire
-            # at any point during the attack? Did IF flag any window?
-            drift_caught = drift_fired_count > 0
-            iforest_caught = iforest_fired_count > 0
+            # Temporal correlation: drift/IF count as "catching this file"
+            # only if they fired in a window near the file's mtime.
+            # Without this, a single drift hit anywhere in the session
+            # would mark every locked file as caught — including decoys
+            # injected after the burst ended.
+            try:
+                file_mtime = datetime.fromtimestamp(fp.stat().st_mtime, tz=timezone.utc)
+            except OSError:
+                file_mtime = None
+
+            drift_caught = False
+            iforest_caught = False
+            if file_mtime is not None:
+                drift_caught = any(
+                    str(r.get("severity", "")).upper() in self.DRIFT_CATCH_SEVERITIES
+                    and abs((dt - file_mtime).total_seconds()) <= window
+                    for dt, r in drift_dt_records
+                )
+                iforest_caught = any(
+                    bool(r.get("anomaly"))
+                    and abs((dt - file_mtime).total_seconds()) <= window
+                    for dt, r in iforest_dt_records
+                )
 
             file_info = {
                 "file_path": path_str,
@@ -161,18 +219,31 @@ class Reverifier:
                 )
 
             if not drift_caught:
-                reasons.append(
-                    "drift: no detector fired during this session — activity volume "
-                    "may have been below the burst threshold, or the baseline (10 "
-                    "windows minimum) had not yet been established"
-                )
+                if drift_fired_count > 0:
+                    reasons.append(
+                        f"drift: detectors fired {drift_fired_count}x this session "
+                        f"but none within ±{int(window)}s of this file — file likely "
+                        "appeared in an isolated/quiet window"
+                    )
+                else:
+                    reasons.append(
+                        "drift: no detector fired during this session — activity "
+                        "volume may have been below the burst threshold, or the "
+                        "baseline (10 windows minimum) had not yet been established"
+                    )
 
             if not iforest_caught:
-                reasons.append(
-                    "iforest: no anomaly flagged — model may still be in training "
-                    "phase (needs 50 samples), or the burst pattern was within the "
-                    "learned normal envelope"
-                )
+                if iforest_fired_count > 0:
+                    reasons.append(
+                        f"iforest: flagged {iforest_fired_count} anomalies this "
+                        f"session but none within ±{int(window)}s of this file"
+                    )
+                else:
+                    reasons.append(
+                        "iforest: no anomaly flagged — model may still be in "
+                        "training phase (needs 50 samples), or the burst pattern "
+                        "was within the learned normal envelope"
+                    )
 
             file_info["reasons"] = reasons
             missed.append(file_info)

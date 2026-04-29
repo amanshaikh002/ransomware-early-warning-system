@@ -214,6 +214,12 @@ class DecisionAgent:
                 self._transition(self.RESPONDING, "two consecutive high windows", risk_record)
             elif not is_high:
                 self._consecutive_high = 0
+                # Decay back to MONITORING after several quiet windows so a
+                # one-off spike doesn't pin the agent in ALERT forever.
+                if self._consecutive_below_30 >= 3:
+                    self._state = self.MONITORING
+                    self._write_incident("MONITORING", risk_record)
+                    logger.info("DecisionAgent transitioned ALERT -> MONITORING (3 quiet windows)")
 
         elif self._state == self.RESPONDING:
             if self._consecutive_below_30 >= 3:

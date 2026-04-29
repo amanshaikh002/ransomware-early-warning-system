@@ -32,34 +32,137 @@
     }
 
     .container {
-      max-width: 1200px;
+      max-width: 1400px;
       margin: 0 auto;
-      padding: 1rem;
+      padding: 0 1.25rem 1.5rem;
       display: grid;
       gap: 1rem;
-      grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+      grid-template-columns: repeat(12, 1fr);
     }
 
     .card {
       background: var(--card);
       border: 1px solid var(--border);
       border-radius: 14px;
-      padding: 1rem;
-      box-shadow: 0 8px 24px rgba(16, 35, 48, 0.07);
+      padding: 1.1rem 1.2rem;
+      box-shadow: 0 6px 20px rgba(16, 35, 48, 0.06);
+      transition: transform 0.18s ease, box-shadow 0.18s ease;
+      grid-column: 1 / -1;
     }
 
-    h1 {
+    .card:hover {
+      transform: translateY(-1px);
+      box-shadow: 0 10px 28px rgba(16, 35, 48, 0.09);
+    }
+
+    .card h3 {
+      margin: 0 0 0.6rem;
+      font-size: 1.05rem;
+      font-weight: 600;
+    }
+
+    /* 12-col grid: top 3 cards (4 cols each) fill row 1; Live Simulation
+       gets row 2 alone at 1/3 width. Drift Alerts and Re-verification
+       span full width. */
+    .card-risk,
+    .card-agent,
+    .card-pipeline,
+    .card-sim      { grid-column: span 4; }
+
+    .card-alerts,
+    .card-reverify { grid-column: 1 / -1; }
+
+    @media (max-width: 1100px) {
+      .card-risk, .card-agent, .card-pipeline, .card-sim {
+        grid-column: span 6;
+      }
+    }
+    @media (max-width: 720px) {
+      .card-risk, .card-agent, .card-pipeline, .card-sim {
+        grid-column: 1 / -1;
+      }
+    }
+
+    /* Header bar — brand on the left, Reset Session on the right. */
+    .topbar {
+      max-width: 1400px;
+      margin: 0 auto;
+      padding: 1.5rem 1.25rem 1.2rem;
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 1rem;
+      flex-wrap: wrap;
+    }
+
+    .brand {
+      display: flex;
+      align-items: center;
+      gap: 1rem;
+    }
+
+    .brand .logo {
+      width: 56px;
+      height: 56px;
+      border-radius: 14px;
+      background: linear-gradient(135deg, #0b5c8f 0%, #1899c8 100%);
+      color: #fff;
+      display: grid;
+      place-items: center;
+      font-size: 1.7rem;
+      box-shadow: 0 6px 18px rgba(11, 92, 143, 0.28);
+      flex-shrink: 0;
+    }
+
+    .brand h1 {
       margin: 0;
-      padding: 1rem;
-      text-align: center;
-      font-size: 1.4rem;
+      font-size: 1.75rem;
+      font-weight: 700;
+      letter-spacing: -0.015em;
+      line-height: 1.15;
+    }
+
+    .brand .subtitle {
+      font-size: 0.95rem;
+      color: var(--muted);
+      margin-top: 0.2rem;
+    }
+
+    @media (max-width: 720px) {
+      .topbar { justify-content: center; text-align: center; }
+      .brand { flex-direction: row; justify-content: center; }
+      .brand h1 { font-size: 1.4rem; }
+      .brand .subtitle { font-size: 0.85rem; }
+    }
+
+    .reset-btn {
+      background: #fff;
+      color: var(--text);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 0.5rem 0.9rem;
+      font-size: 0.85rem;
+      font-weight: 600;
+      cursor: pointer;
+      transition: background 0.15s ease, border-color 0.15s ease, color 0.15s ease;
+    }
+
+    .reset-btn:hover {
+      background: #eef4f9;
+      border-color: #b8cee0;
+    }
+
+    .reset-btn:disabled {
+      opacity: 0.6;
+      cursor: not-allowed;
     }
 
     .gauge-wrap {
       display: flex;
       align-items: center;
       justify-content: center;
-      min-height: 280px;
+      padding: 0.6rem 0 0.4rem;
+      min-height: 240px;
     }
 
     .gauge {
@@ -69,7 +172,7 @@
       background: conic-gradient(var(--ok) 0deg, var(--ok) 0deg, var(--ring-bg) 0deg);
       display: grid;
       place-items: center;
-      transition: background 0.4s ease;
+      transition: background 0.6s ease;
     }
 
     .gauge::before {
@@ -79,6 +182,7 @@
       border-radius: 50%;
       background: var(--card);
       position: absolute;
+      box-shadow: inset 0 2px 6px rgba(16, 35, 48, 0.04);
     }
 
     .gauge-value {
@@ -86,7 +190,8 @@
       z-index: 1;
       text-align: center;
       font-weight: 700;
-      font-size: 2rem;
+      font-size: 2.1rem;
+      transition: color 0.3s ease;
     }
 
     .gauge-label {
@@ -103,6 +208,65 @@
       font-size: 0.85rem;
       border: 1px solid var(--border);
       background: #eef4f9;
+      transition: background 0.2s ease, color 0.2s ease;
+    }
+
+    .badge.state-MONITORING { background: #e8f5ee; color: #1f7a3f; border-color: #c5e6d3; }
+    .badge.state-ALERT      { background: #fff7d6; color: #8a6d00; border-color: #f0deaa; }
+    .badge.state-RESPONDING { background: #ffe1c2; color: #aa4f00; border-color: #f3c79c; }
+    .badge.state-RECOVERING { background: #dff1ff; color: #1869a0; border-color: #b6dcf3; }
+
+    .sev-pill {
+      display: inline-block;
+      padding: 0.15rem 0.55rem;
+      border-radius: 999px;
+      font-size: 0.74rem;
+      font-weight: 700;
+      letter-spacing: 0.02em;
+    }
+
+    .sev-LOW    { background: #fff7d6; color: #8a6d00; }
+    .sev-MEDIUM { background: #ffe1c2; color: #aa4f00; }
+    .sev-HIGH   { background: #ffd6d6; color: #a40000; }
+    .sev-NONE   { background: #eef4f9; color: var(--muted); }
+
+    /* Subtle pulse when a value updates — used on counters */
+    @keyframes pulse-soft {
+      0%   { background: #fff8d8; }
+      100% { background: transparent; }
+    }
+    .updated {
+      animation: pulse-soft 0.7s ease-out;
+      border-radius: 6px;
+    }
+
+    /* Detection Pipeline stat grid: 2x2 with even spacing,
+       baselines aligned, and counters that share a font scale. */
+    .pipeline-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 1rem 1.2rem;
+      margin-top: 0.4rem;
+    }
+    .ph-stat {
+      display: flex;
+      flex-direction: column;
+      gap: 0.25rem;
+    }
+    .ph-label {
+      color: var(--muted);
+      font-size: 0.78rem;
+      letter-spacing: 0.02em;
+      text-transform: uppercase;
+    }
+    .ph-value {
+      font-size: 1.55rem;
+      font-weight: 700;
+      letter-spacing: -0.01em;
+      line-height: 1.1;
+    }
+    .ph-value.ph-status {
+      font-size: 1.05rem;
     }
 
     .status-row {
@@ -251,9 +415,18 @@
   </style>
 </head>
 <body>
-  <h1>Ransomware Early-Warning Dashboard</h1>
+  <header class="topbar">
+    <div class="brand">
+      <div class="logo">🛡</div>
+      <div>
+        <h1>Ransomware Early-Warning Dashboard</h1>
+        <div class="subtitle">Agentic AI defense — file entropy, behavioral drift, blockchain evidence</div>
+      </div>
+    </div>
+    <button id="resetBtn" class="reset-btn" type="button" title="Clear all session data and start fresh — preserves the trained ML model and the blockchain ledger">Reset Session</button>
+  </header>
   <div class="container">
-    <section class="card">
+    <section class="card card-risk">
       <h3>Current Risk</h3>
       <div class="gauge-wrap">
         <div id="riskGauge" class="gauge">
@@ -263,13 +436,13 @@
           </div>
         </div>
       </div>
-      <div class="status-row">
+      <div class="status-row" style="margin-top: 0.4rem;">
         <div>Level: <strong id="riskLevel">NORMAL</strong></div>
         <div>Entropy Flag: <strong id="entropyFlag">0</strong></div>
       </div>
     </section>
 
-    <section class="card">
+    <section class="card card-agent">
       <h3>Agent and Integrity</h3>
       <div class="status-row" style="margin-bottom: 1rem;">
         <div>Agent State: <span id="agentState" class="badge">MONITORING</span></div>
@@ -278,7 +451,29 @@
       <canvas id="riskChart"></canvas>
     </section>
 
-    <section class="card">
+    <section class="card card-pipeline">
+      <h3>Detection Pipeline</h3>
+      <div class="pipeline-grid">
+        <div class="ph-stat">
+          <div class="ph-label">File Events</div>
+          <div class="ph-value" id="phEvents">0</div>
+        </div>
+        <div class="ph-stat">
+          <div class="ph-label">Risk Scores</div>
+          <div class="ph-value" id="phScores">0</div>
+        </div>
+        <div class="ph-stat">
+          <div class="ph-label">Entropy Alerts</div>
+          <div class="ph-value" id="phEntropy">0</div>
+        </div>
+        <div class="ph-stat">
+          <div class="ph-label">ML Model</div>
+          <div class="ph-value ph-status" id="phIfStatus">Training…</div>
+        </div>
+      </div>
+    </section>
+
+    <section class="card card-sim">
       <h3>Live Simulation</h3>
       <p style="margin: 0; color: var(--muted); font-size: 0.9rem;">
         Run sandbox activity directly from the dashboard and watch alerts update live.
@@ -311,7 +506,7 @@
       <div id="simStatus" class="sim-status">Idle</div>
     </section>
 
-    <section class="card" style="grid-column: 1 / -1;">
+    <section class="card card-alerts">
       <h3>Recent Drift Alerts</h3>
       <div class="scroll">
         <table>
@@ -329,7 +524,7 @@
       </div>
     </section>
 
-    <section class="card" style="grid-column: 1 / -1;">
+    <section class="card card-reverify">
       <div class="status-row" style="margin-bottom: 0.6rem;">
         <h3 style="margin: 0;">Re-verification Report</h3>
         <div style="display: flex; gap: 0.5rem;">
@@ -391,6 +586,37 @@
     const simStatus = document.getElementById("simStatus");
     const reverifyBtn = document.getElementById("reverifyBtn");
     const injectDecoyBtn = document.getElementById("injectDecoyBtn");
+    const phEvents = document.getElementById("phEvents");
+    const phScores = document.getElementById("phScores");
+    const phEntropy = document.getElementById("phEntropy");
+    const phIfStatus = document.getElementById("phIfStatus");
+    const resetBtn = document.getElementById("resetBtn");
+
+    function formatLocalTime(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso;
+      return d.toLocaleTimeString();
+    }
+
+    function formatLocalDateTime(iso) {
+      if (!iso) return "";
+      const d = new Date(iso);
+      if (Number.isNaN(d.getTime())) return iso;
+      return d.toLocaleString();
+    }
+
+    function setText(node, value) {
+      if (!node) return;
+      const next = String(value);
+      if (node.textContent !== next) {
+        node.textContent = next;
+        node.classList.remove("updated");
+        // Force reflow so the animation restarts on every change
+        void node.offsetWidth;
+        node.classList.add("updated");
+      }
+    }
     const reverifyEmpty = document.getElementById("reverifyEmpty");
     const reverifySummary = document.getElementById("reverifySummary");
     const rvTotal = document.getElementById("rvTotal");
@@ -429,7 +655,8 @@
 
     function gaugeColor(score) {
       if (score < 30) return "#1f9d55";
-      if (score <= 60) return "#d08a00";
+      if (score < 60) return "#d08a00";
+      if (score < 80) return "#e07b00";
       return "#c62828";
     }
 
@@ -438,19 +665,29 @@
       const color = gaugeColor(safeScore);
       const degrees = (safeScore / 100) * 360;
       gauge.style.background = `conic-gradient(${color} ${degrees}deg, var(--ring-bg) ${degrees}deg)`;
+      riskValue.style.color = color;
       riskValue.textContent = safeScore.toFixed(1);
     }
 
     function renderAlerts(alerts) {
       alertsBody.innerHTML = "";
+      if (!alerts || alerts.length === 0) {
+        const row = document.createElement("tr");
+        row.innerHTML = `<td colspan="5" style="text-align:center; color: var(--muted); padding: 1.2rem;">No drift alerts yet — they will appear here as detectors fire.</td>`;
+        alertsBody.appendChild(row);
+        return;
+      }
       alerts.forEach((item) => {
+        const sev = String(item.severity || "NONE").toUpperCase();
+        const wr = item.write_rate ?? "";
+        const rc = item.rename_count ?? "";
         const row = document.createElement("tr");
         row.innerHTML = `
-          <td>${item.timestamp || ""}</td>
-          <td>${item.severity || ""}</td>
-          <td>${item.top_feature || ""}</td>
-          <td>${item.write_rate ?? ""}</td>
-          <td>${item.rename_count ?? ""}</td>
+          <td>${formatLocalTime(item.timestamp)}</td>
+          <td><span class="sev-pill sev-${sev}">${sev}</span></td>
+          <td>${item.top_feature || "—"}</td>
+          <td>${wr}</td>
+          <td>${rc}</td>
         `;
         alertsBody.appendChild(row);
       });
@@ -528,7 +765,7 @@
       rvCaught.textContent = report.caught_count ?? 0;
       rvMissed.textContent = report.missed_count ?? 0;
       rvCoverage.textContent = `${report.coverage_percent ?? 0}%`;
-      rvTimestamp.textContent = (report.timestamp || "").replace("T", " ").slice(0, 19) + " UTC";
+      rvTimestamp.textContent = formatLocalDateTime(report.timestamp);
 
       const det = report.detector_summary || {};
       rvEntropyHits.textContent = det.entropy_alerts_high ?? 0;
@@ -591,17 +828,23 @@
       injectDecoyBtn.disabled = true;
       const originalLabel = injectDecoyBtn.textContent;
       injectDecoyBtn.textContent = "Injecting…";
+      reverifyEmpty.style.display = "block";
+      reverifyEmpty.style.color = "var(--muted)";
+      reverifyEmpty.textContent = "Injecting decoy file…";
       try {
         const res = await fetch("/api/inject_decoy_missed", { method: "POST" });
         const data = await res.json();
         if (data.ok) {
-          // Give the watcher a moment to ingest the new file before re-auditing.
+          reverifyEmpty.textContent = "Decoy injected — auditing in 1.5s…";
           setTimeout(reverifyNow, 1500);
         } else {
-          console.error("Inject decoy failed", data);
+          reverifyEmpty.style.color = "var(--danger)";
+          const hint = data.hint ? ` (${data.hint})` : "";
+          reverifyEmpty.textContent = `Inject failed: ${data.error || "unknown error"}${hint}`;
         }
       } catch (err) {
-        console.error("Inject decoy failed", err);
+        reverifyEmpty.style.color = "var(--danger)";
+        reverifyEmpty.textContent = `Inject failed: network error (${err.message || err})`;
       } finally {
         injectDecoyBtn.disabled = false;
         injectDecoyBtn.textContent = originalLabel;
@@ -616,7 +859,9 @@
         updateGauge(Number(data.current_risk_score || 0));
         riskLevel.textContent = data.current_level || "NORMAL";
         entropyFlag.textContent = data.last_entropy_flag ?? 0;
-        agentState.textContent = data.agent_state || "MONITORING";
+        const stateName = (data.agent_state || "MONITORING").toUpperCase();
+        agentState.textContent = stateName;
+        agentState.className = "badge state-" + stateName;
 
         const valid = Boolean(data.chain_valid);
         chainIndicator.querySelector(".dot").style.background = valid ? "#1f9d55" : "#c62828";
@@ -627,20 +872,67 @@
         stopSimBtn.disabled = !simRunning;
         if (simRunning) {
           simStatus.textContent = `Simulation running: ${data.simulator_mode || "unknown"}`;
+          simStatus.style.color = "var(--muted)";
+        } else if (data.simulator_last_defense) {
+          simStatus.textContent = `🛡  ${data.simulator_last_defense}`;
+          simStatus.style.color = "var(--ok)";
         } else if (data.simulator_last_error) {
           simStatus.textContent = `Last run error: ${data.simulator_last_error}`;
+          simStatus.style.color = "var(--danger)";
         } else {
           simStatus.textContent = "Idle";
+          simStatus.style.color = "var(--muted)";
+        }
+
+        const ph = data.pipeline || {};
+        setText(phEvents, (ph.file_events_total ?? 0).toLocaleString());
+        setText(phScores, (ph.risk_scores_total ?? 0).toLocaleString());
+        setText(phEntropy, (ph.entropy_alerts_total ?? 0).toLocaleString());
+        if (phIfStatus) {
+          if (ph.iforest_trained) {
+            phIfStatus.textContent = "✓ Trained";
+            phIfStatus.style.color = "var(--ok)";
+          } else {
+            phIfStatus.textContent = "Training…";
+            phIfStatus.style.color = "var(--warn)";
+          }
         }
 
         renderAlerts(data.recent_alerts || []);
 
         const history = data.risk_history || [];
-        chart.data.labels = history.map((row) => (row.timestamp || "").slice(11, 19));
+        chart.data.labels = history.map((row) => formatLocalTime(row.timestamp));
         chart.data.datasets[0].data = history.map((row) => Number(row.score || 0));
-        chart.update();
+        chart.update("none");
       } catch (err) {
         console.error("Dashboard refresh failed", err);
+      }
+    }
+
+    async function resetSession() {
+      if (!confirm("Reset session?\n\nThis clears all event history, risk scores, drift alerts, and the re-verification report. The trained ML model and the blockchain ledger are preserved.")) {
+        return;
+      }
+      resetBtn.disabled = true;
+      const originalLabel = resetBtn.textContent;
+      resetBtn.textContent = "Resetting…";
+      try {
+        const res = await fetch("/api/reset_session", { method: "POST" });
+        const data = await res.json();
+        if (!data.ok) {
+          alert("Reset failed: " + (data.error || "unknown error"));
+        } else {
+          chart.data.labels = [];
+          chart.data.datasets[0].data = [];
+          chart.update("none");
+          await refreshStatus();
+          await fetchReverification();
+        }
+      } catch (err) {
+        alert("Reset failed: network error");
+      } finally {
+        resetBtn.disabled = false;
+        resetBtn.textContent = originalLabel;
       }
     }
 
@@ -648,6 +940,7 @@
     stopSimBtn.addEventListener("click", stopSimulation);
     reverifyBtn.addEventListener("click", reverifyNow);
     injectDecoyBtn.addEventListener("click", injectDecoy);
+    resetBtn.addEventListener("click", resetSession);
     refreshStatus();
     fetchReverification();
     setInterval(refreshStatus, 5000);
