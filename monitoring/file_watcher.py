@@ -489,7 +489,9 @@ class FileWatcher:
 #: Dedicated sandbox directory used by the ransomware simulator.
 #: All monitored activity is confined to this path so internal project
 #: files (including JSONL streams) are not observed.
-WATCH_DIRECTORY: str = r"C:\Users\aarya\OneDrive\Desktop\College stuff\VIT\TY\S6\CSAB\CP\ransomware_test"
+
+WATCH_DIRECTORY: str = os.path.join(os.path.expanduser("~"), "Documents", "ransomware_test")
+
 
 
 def get_default_monitored_paths() -> list[str]:
