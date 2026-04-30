@@ -20,14 +20,7 @@ Three operational modes are supported:
     --mode ransomware  Simulated encryption: base64-encode → rename
                        to .locked → delete original
 
-Safety
-------
-ALL activity is confined to::
 
-    C:\\Users\\aarya\\OneDrive\\Desktop\\College stuff\\VIT\\TY\\S6\\CSAB\\CP\\ransomware_test
-
-The directory is created automatically and **no files outside it are
-ever touched**.
 
 Libraries
 ---------
